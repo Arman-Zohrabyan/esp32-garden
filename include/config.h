@@ -148,3 +148,151 @@
 //
 // Jumper J2 on the board disconnects the divider from the cell entirely. Then
 // GPIO34 sees almost 0 V, and the reading is rejected by BATTERY_VALID_MIN_VOLTS.
+#define BATTERY_R1 1000000.0f
+#define BATTERY_R2 1000000.0f
+
+// GPIO26 = voltage divider switch (see above). An ADC2 pin, but here it is only
+// a digital output, and Wi-Fi doesn't interfere with ADC2 pins' digital functions.
+#define PIN_BAT_EN 26
+
+// How long to wait after turning on the divider before the first reading. The midpoint
+// charges through 0.5 MOhm (R1 || R2) into 10 nF: τ = 5 ms, so 50 ms is 10τ.
+#define BATTERY_SETTLE_MS 50
+
+// Calibration factor. Compensates both for resistor tolerance (typical ones are
+// 5%, two 100k ones can give a divider ratio of 1.9 instead of 2.0) and residual
+// ADC error.
+//
+// How to tune: measure the actual battery voltage with a multimeter,
+// see what the log shows, and compute
+//   BATTERY_CALIB = actual / shown
+// Usually it comes out at 1.02-1.08. One point is enough.
+#define BATTERY_CALIB 1.0f
+
+// How many samples we average per reading.
+#define BATTERY_SAMPLES 32
+
+// Exponential smoothing factor for the percentage: the smaller, the
+// smoother, but the slower the response to a real change.
+#define BATTERY_SMOOTH 0.1f
+
+// ---------- charge thresholds ----------
+//
+// The software cutoff doesn't replace the TP4056 board's protection, it complements it:
+// the hardware one only trips at 2.5 V, when the cell has already spent several hours
+// in the accelerated-aging zone. The point of the software one is not to get there.
+
+// Warning: send a notification, increase intervals.
+#define BATTERY_WARN_VOLTS 3.6f
+
+// Below this — don't turn on Wi-Fi. At transmitter peak (up to 400 mA) the cell, wires
+// and XC6220 lose another 0.1-0.2 V, and the ESP32 will brown out. The active cycle
+// in this case immediately sleeps for BATTERY_LOW_SLEEP_SECONDS (see main.cpp).
+// Don't turn on the pump either: the motor's inrush current will drag the cell down the same way.
+#define BATTERY_LOW_VOLTS 3.45f
+
+// Hysteresis: after a cutoff at BATTERY_LOW_VOLTS, Wi-Fi turns back on
+// only above this voltage, i.e. after charging. Without it, a cell
+// that recovered to 3.46 V during sleep would turn on Wi-Fi, sag and go back to
+// sleep — and so on in a loop, finishing itself off.
+#define BATTERY_RESUME_VOLTS 3.6f
+
+// Sleep with a depleted cell: 12 hours. Sleep current is tens of uA, so it
+// doesn't finish off the cell, and the board will notice charging within 12 hours at most.
+#define BATTERY_LOW_SLEEP_SECONDS (12UL * 3600)
+
+// Only for the log label. Below BATTERY_LOW_VOLTS the board already sleeps for
+// 12 hours without Wi-Fi.
+#define BATTERY_CRITICAL_VOLTS 3.3f
+
+// Below this voltage the reading is considered invalid and isn't sent to the server.
+// A live Li-ion cell never gives that little: the TP4056 protection cuts off the
+// load already at 2.5 V. So such a value means not discharge but a
+// removed jumper J2 or a disconnected voltage divider. Sending it to battery_logs
+// is not allowed: the chart would fill up with zeros indistinguishable from a real discharge.
+// Such a reading doesn't trigger the BATTERY_LOW_VOLTS protection either.
+#define BATTERY_VALID_MIN_VOLTS 2.5f
+
+// Above this — also invalid: a full cell gives 4.2 V. More happens
+// only if the divider didn't turn on (GPIO26 not LOW) — then the bottom of R2
+// floats, GPIO34 receives almost the whole cell, and the ADC hits its ceiling.
+#define BATTERY_VALID_MAX_VOLTS 4.5f
+
+// ---------- pump (auto-watering, since firmware 0.4.0) ----------
+//
+// The pump is powered from a SEPARATE cell (its own TP4056); the ESP32 only opens
+// the switch. Circuit: pump cell + -> MT3608 (5 V) -> pump; the MT3608 ground goes
+// to the IRLZ44N drain, source to common ground. Switch closed — the boost converter
+// is fully unpowered; the pump cell supplies nothing in sleep or while
+// awake, except during watering itself.
+
+// GPIO27 -> 100 Ohm -> IRLZ44N gate, 10 kOhm between gate and ground.
+// HIGH = pump running. While the pin isn't configured (reset, boot, sleep), the
+// 10 kOhm pull-down keeps it off. An ADC2 pin, but here only a digital
+// output — Wi-Fi doesn't interfere with it.
+#define PIN_PUMP 27
+
+// The pump cell's voltage divider is a copy of the main one: R3/R4 1 MOhm each, 10 nF from
+// the midpoint to ground, jumper J5 disconnects it from the cell entirely.
+// Midpoint on GPIO35 (ADC1_CH7, input-only), bottom of R4 on GPIO33.
+//
+// Unlike the main divider, this one is turned on only for the duration of a
+// reading (GPIO33 LOW) and immediately turned off: the board doesn't touch the pump cell
+// more than necessary. In sleep GPIO33 is isolated, zero current through the divider.
+#define PIN_PUMP_BAT    35
+#define PIN_PUMP_BAT_EN 33
+#define PUMP_BAT_R1 1000000.0f
+#define PUMP_BAT_R2 1000000.0f
+
+// Calibration — same as BATTERY_CALIB: actual (multimeter) / shown.
+#define PUMP_BAT_CALIB 1.0f
+
+// PumpSettings defaults — match the server's. Used until the server has
+// sent its own, and for watering without connectivity if the NVS cache is empty.
+#define DEF_PUMP_ENABLED         true
+#define DEF_WATER_ML             350     // ml per watering
+#define DEF_PUMP_FLOW            26.67f  // ml/s at 5 V: 1000 ml in 37.5 s (measured)
+#define DEF_POST_WATER_SLEEP     600     // s, sleep after watering until the check reading
+#define DEF_MAX_WATERINGS_DAY    3       // waterings in any 24 hours
+#define DEF_PUMP_MIN_VOLT        3.3f    // below this — no watering
+#define DEF_MAX_PUMP_SECONDS     60      // limit for one run
+
+// Absolute ceiling for one run, whatever the server sends. The server
+// checks its own limits itself; this is the second line: a pump left
+// running will empty the tank onto the floor.
+#define PUMP_ABS_MAX_SECONDS 300
+
+// How many recent waterings the board remembers for the daily limit without connectivity.
+// Must be no less than the server maximum maxWateringsPerDay (8).
+#define WATERING_RING_SIZE 8
+
+// How many waterings can wait to be sent to the server (RTC memory). One watering
+// per cycle, 10-minute sleep after watering — four is enough for several hours
+// without connectivity; on overflow the oldest one is evicted.
+#define WATERING_QUEUE_SIZE 4
+
+// Default sleep duration until the server has sent its sleepSeconds.
+// In step 9 this will be replaced with g_dev.sleepSeconds.
+#define SLEEP_US (10ULL * 1000000)
+
+#define AP_SSID   "ESP32-Garden"
+#define AP_PASS   "12345678"
+#define MDNS_HOST "garden"       // board address: http://garden.local
+
+// ---------- reliability limits ----------
+
+// Connectivity failure counter. Previously the board switched to web mode based on it after
+// five cycles; now the decision is made by the readings buffer (readings.h) — it
+// gives up only when it is full. The counter remains as diagnostics: its
+// value goes into the wifi_failed log as the missedCycles field, and it shows
+// how many wake-ups passed without connectivity.
+#define MAX_FAIL_STREAK 5
+
+// Rated endurance of an NVS sector — erase cycles. The number is from the datasheet for
+// the ESP32 flash memory; used only to estimate wear in logs, it doesn't affect
+// firmware behavior.
+//
+// The real margin is higher: NVS spreads writes across the sector (wear leveling),
+// so "write counter / endurance" is an UPPER estimate. If it
+// shows 10%, the real wear is lower.
+#define NVS_ENDURANCE 100000UL
