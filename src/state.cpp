@@ -148,3 +148,156 @@ void loadSoilConfig() {
   g_soil.autoWaterPercent = prefs.getInt("autoPct", DEF_AUTO_WATER_PERCENT);
   g_soil.revision        = prefs.getInt("rev", 0);
   g_soil.appliedRevision = prefs.getInt("appliedRev", -1);
+  prefs.end();
+}
+
+int saveSoilConfig() {
+  Preferences prefs;
+  prefs.begin("soil", false);
+  int written = 0;
+  // The get* defaults mirror loadSoilConfig() — see the comment in
+  // saveDeviceConfig().
+  if (prefs.getInt("dry", DEF_SOIL_DRY) != g_soil.soilDry) {
+    prefs.putInt("dry", g_soil.soilDry);                         written++;
+  }
+  if (prefs.getInt("wet", DEF_SOIL_WET) != g_soil.soilWet) {
+    prefs.putInt("wet", g_soil.soilWet);                         written++;
+  }
+  if (prefs.getUInt("everyMs", DEF_SOIL_EVERY_MS) != g_soil.soilEveryMs) {
+    prefs.putUInt("everyMs", g_soil.soilEveryMs);                written++;
+  }
+  if (prefs.getInt("avgCnt", DEF_SOIL_AVG_COUNT) != g_soil.soilAvgCount) {
+    prefs.putInt("avgCnt", g_soil.soilAvgCount);                 written++;
+  }
+  if (prefs.getInt("dryPct", DEF_DRY_ALERT_PERCENT) != g_soil.dryAlertPercent) {
+    prefs.putInt("dryPct", g_soil.dryAlertPercent);              written++;
+  }
+  if (prefs.getInt("autoPct", DEF_AUTO_WATER_PERCENT) != g_soil.autoWaterPercent) {
+    prefs.putInt("autoPct", g_soil.autoWaterPercent);            written++;
+  }
+  if (prefs.getInt("rev", 0) != g_soil.revision) {
+    prefs.putInt("rev", g_soil.revision);                        written++;
+  }
+  if (prefs.getInt("appliedRev", -1) != g_soil.appliedRevision) {
+    prefs.putInt("appliedRev", g_soil.appliedRevision);          written++;
+  }
+  prefs.end();
+  return written;
+}
+
+// ---------- Battery ----------
+
+void loadBatteryConfig() {
+  Preferences prefs;
+  prefs.begin("bat", true);
+  g_bat.checkEveryMs  = prefs.getUInt("everyMs", DEF_BAT_EVERY_MS);
+  g_bat.checkAvgCount = prefs.getInt("avgCnt", DEF_BAT_AVG_COUNT);
+  g_bat.alertPercent  = prefs.getInt("alertPct", DEF_BAT_ALERT_PERCENT);
+  prefs.end();
+}
+
+int saveBatteryConfig() {
+  Preferences prefs;
+  prefs.begin("bat", false);
+  int written = 0;
+  // The get* defaults mirror loadBatteryConfig() — see the comment in
+  // saveDeviceConfig().
+  if (prefs.getUInt("everyMs", DEF_BAT_EVERY_MS) != g_bat.checkEveryMs) {
+    prefs.putUInt("everyMs", g_bat.checkEveryMs);                written++;
+  }
+  if (prefs.getInt("avgCnt", DEF_BAT_AVG_COUNT) != g_bat.checkAvgCount) {
+    prefs.putInt("avgCnt", g_bat.checkAvgCount);                 written++;
+  }
+  if (prefs.getInt("alertPct", DEF_BAT_ALERT_PERCENT) != g_bat.alertPercent) {
+    prefs.putInt("alertPct", g_bat.alertPercent);                written++;
+  }
+  prefs.end();
+  return written;
+}
+
+// ---------- Pump ----------
+
+void loadPumpConfig() {
+  Preferences prefs;
+  prefs.begin("pump", true);
+  g_pump.autoWaterEnabled      = prefs.getBool("on", DEF_PUMP_ENABLED);
+  g_pump.waterMl               = prefs.getInt("ml", DEF_WATER_ML);
+  g_pump.flowMlPerSec          = prefs.getFloat("flow", DEF_PUMP_FLOW);
+  g_pump.postWaterSleepSeconds = prefs.getUInt("postSleep", DEF_POST_WATER_SLEEP);
+  g_pump.maxWateringsPerDay    = prefs.getInt("perDay", DEF_MAX_WATERINGS_DAY);
+  g_pump.minBatteryVolt        = prefs.getFloat("minVolt", DEF_PUMP_MIN_VOLT);
+  g_pump.maxPumpSeconds        = prefs.getInt("maxSec", DEF_MAX_PUMP_SECONDS);
+  g_pump.revision              = prefs.getInt("rev", 0);
+  g_pump.appliedRevision       = prefs.getInt("appliedRev", -1);
+  g_pump.batCheckEveryMs       = prefs.getUInt("batEvery", DEF_BAT_EVERY_MS);
+  g_pump.batCheckAvgCount      = prefs.getInt("batAvg", DEF_BAT_AVG_COUNT);
+  prefs.end();
+}
+
+int savePumpConfig() {
+  Preferences prefs;
+  prefs.begin("pump", false);
+  int written = 0;
+  // The get* defaults mirror loadPumpConfig() — see the comment in
+  // saveDeviceConfig(). floats are compared exactly: the value is parsed every time
+  // from the same JSON and yields the same float.
+  if (prefs.getBool("on", DEF_PUMP_ENABLED) != g_pump.autoWaterEnabled) {
+    prefs.putBool("on", g_pump.autoWaterEnabled);                written++;
+  }
+  if (prefs.getInt("ml", DEF_WATER_ML) != g_pump.waterMl) {
+    prefs.putInt("ml", g_pump.waterMl);                          written++;
+  }
+  if (prefs.getFloat("flow", DEF_PUMP_FLOW) != g_pump.flowMlPerSec) {
+    prefs.putFloat("flow", g_pump.flowMlPerSec);                 written++;
+  }
+  if (prefs.getUInt("postSleep", DEF_POST_WATER_SLEEP) != g_pump.postWaterSleepSeconds) {
+    prefs.putUInt("postSleep", g_pump.postWaterSleepSeconds);    written++;
+  }
+  if (prefs.getInt("perDay", DEF_MAX_WATERINGS_DAY) != g_pump.maxWateringsPerDay) {
+    prefs.putInt("perDay", g_pump.maxWateringsPerDay);           written++;
+  }
+  if (prefs.getFloat("minVolt", DEF_PUMP_MIN_VOLT) != g_pump.minBatteryVolt) {
+    prefs.putFloat("minVolt", g_pump.minBatteryVolt);            written++;
+  }
+  if (prefs.getInt("maxSec", DEF_MAX_PUMP_SECONDS) != g_pump.maxPumpSeconds) {
+    prefs.putInt("maxSec", g_pump.maxPumpSeconds);               written++;
+  }
+  if (prefs.getInt("rev", 0) != g_pump.revision) {
+    prefs.putInt("rev", g_pump.revision);                        written++;
+  }
+  if (prefs.getInt("appliedRev", -1) != g_pump.appliedRevision) {
+    prefs.putInt("appliedRev", g_pump.appliedRevision);          written++;
+  }
+  if (prefs.getUInt("batEvery", DEF_BAT_EVERY_MS) != g_pump.batCheckEveryMs) {
+    prefs.putUInt("batEvery", g_pump.batCheckEveryMs);           written++;
+  }
+  if (prefs.getInt("batAvg", DEF_BAT_AVG_COUNT) != g_pump.batCheckAvgCount) {
+    prefs.putInt("batAvg", g_pump.batCheckAvgCount);             written++;
+  }
+  prefs.end();
+  return written;
+}
+
+// ---------- migration ----------
+
+void migrateLegacyCollectFlag() {
+  Preferences prefs;
+  prefs.begin("collect", true);
+  bool hadFlag = prefs.isKey("on");
+  bool wasOn   = prefs.getBool("on", false);
+  prefs.end();
+
+  if (!hadFlag) return;                      // nothing to migrate
+
+  // The old collection flag was set — the board would go to sleep right after the update,
+  // and the server knows nothing about it. Fail-safe: clear the flag and go
+  // to web mode, from where the user activates the device again.
+  Serial.printf("Миграция: старый флаг collect/on = %s -> isActive = false\n",
+                wasOn ? "true" : "false");
+
+  prefs.begin("collect", false);
+  prefs.clear();                             // namespace is no longer used
+  prefs.end();
+
+  saveIsActive(false);
+}
