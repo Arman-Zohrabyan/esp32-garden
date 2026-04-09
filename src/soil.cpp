@@ -98,3 +98,100 @@ static SoilWindow runWindow(int count, uint32_t gapMs) {
     // Exactly count-1 pauses: after the last reading there's nothing to wait for, it would only
     // delay sending. delay() feeds the watchdog; busy-waiting isn't allowed here.
     if (i < count - 1) delay(gapMs);
+  }
+
+  w.raw     = sum / count;
+  w.minRaw  = mn;
+  w.maxRaw  = mx;
+  w.percent = soilRawToPercent(w.raw);
+  // With ADC_11db the input measures up to about 3.3 V, 12-bit resolution (0..4095).
+  w.voltage = w.raw * 3.3f / 4095.0f;
+  w.sensorOk = soilLooksConnected(w.raw, mn, mx);
+  return w;
+}
+
+SoilWindow collectWindow(int count, uint32_t gapMs) {
+  if (count < 1) count = 1;
+
+  // Power for the whole window at once, not per reading: toggling it N times
+  // would mean N warm-ups of SOIL_WARMUP_MS and extra transients
+  // at the ADC input — exactly what ruins reading stability.
+  soilPowerOn();
+  SoilWindow w = runWindow(count, gapMs);
+
+  // Readings look suspicious — try restarting the sensor. The point isn't
+  // stubbornness, but that the device sits unattended for weeks and
+  // controls watering: a stuck sensor must not silently return garbage
+  // on which the server would decide to water.
+  for (int attempt = 1; !w.sensorOk && attempt <= SOIL_RETRY_ATTEMPTS; attempt++) {
+    Serial.printf("Показания невалидны (сырое %d, разброс %d) — "
+                  "перезапуск датчика, попытка %d/%d\n",
+                  w.raw, w.maxRaw - w.minRaw, attempt, SOIL_RETRY_ATTEMPTS);
+    soilPowerCycle();
+    w = runWindow(count, gapMs);
+  }
+
+  soilPowerOff();                 // sensor de-energized until the next window
+
+  Serial.printf("Окно из %d: сырое %d | разброс %d..%d (%d) | %.2f В | %d%% | %s%s\n",
+                count, w.raw, w.minRaw, w.maxRaw, w.maxRaw - w.minRaw,
+                w.voltage, w.percent, soilWord(w.percent),
+                w.sensorOk ? "" : " | ДАТЧИК НЕ ОТВЕЧАЕТ");
+  return w;
+}
+
+// Timer-based polling for inactive mode. A reading every soilEveryMs
+// (the web page takes the fresh value from soilRaw/soilPercent); to the port
+// we print one line per soilAvgCount readings — their average.
+void pollSoil() {
+  static unsigned long last = 0;
+  static uint32_t sumRaw = 0;
+  static int  count = 0;
+  static int  minRaw = 0, maxRaw = 0;
+  static int  prevAvg = -1;
+  static int  strikes = 0;      // consecutive windows with open-circuit signs
+
+  if (millis() - last < g_soil.soilEveryMs) return;
+  last = millis();
+
+  // Here readings are spread across loop() calls with pauses of seconds, so
+  // we turn power on for each: keeping it on between readings would mean
+  // powering the sensor almost constantly — exactly what we're avoiding.
+  readSoilOnce();
+
+  if (count == 0) { minRaw = maxRaw = soilRaw; }
+  else {
+    if (soilRaw < minRaw) minRaw = soilRaw;
+    if (soilRaw > maxRaw) maxRaw = soilRaw;
+  }
+  sumRaw += soilRaw;
+  count++;
+
+  if (count < g_soil.soilAvgCount) return;   // window not filled yet
+
+  int avgRaw = sumRaw / count;
+  int avgPct = soilRawToPercent(avgRaw);
+  float volts = avgRaw * 3.3f / 4095.0f;
+
+  int delta = (prevAvg < 0) ? 0 : avgRaw - prevAvg;
+  prevAvg = avgRaw;
+
+  Serial.printf("[%6lus] Почва (среднее из %d) | сырое: %4d (%+4d) | разброс: %4d..%-4d | %.2f В | влажность: %3d%% | %s | пороги: сух %d / мокр %d\n",
+                millis() / 1000, count, avgRaw, delta, minRaw, maxRaw,
+                volts, avgPct, soilWord(avgPct), g_soil.soilDry, g_soil.soilWet);
+
+  // Open-circuit detection: don't trigger on the first hit, so a single spike
+  // (a drop, radio interference) doesn't raise a false alarm.
+  if (!soilLooksConnected(avgRaw, minRaw, maxRaw)) {
+    if (++strikes >= SOIL_DISCONNECT_STRIKES) {
+      Serial.printf(">>> ДАТЧИК НЕ ОТВЕЧАЕТ: сырое %d, разброс %d (порог %d)\n",
+                    avgRaw, maxRaw - minRaw, SOIL_DISCONNECT_SPREAD);
+      strikes = 0;
+    }
+  } else {
+    strikes = 0;
+  }
+
+  sumRaw = 0;
+  count = 0;
+}
