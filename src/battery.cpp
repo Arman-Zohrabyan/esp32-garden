@@ -98,3 +98,101 @@ BatteryReading batteryRead() {
   lastReading.voltage = v;
   lastReading.percent = (int)lroundf(smoothedPercent);
   return lastReading;
+}
+
+BatteryReading batteryLast() {
+  return lastReading;
+}
+
+BatteryReading batteryWindow(int count, uint32_t gapMs) {
+  if (count < 1) count = 1;
+
+  // A window of readings with pauses — same as the soil sensor. A single reading catches
+  // the instantaneous state, and under load Li-ion voltage "breathes":
+  // it sags on a current pulse and recovers within seconds.
+  // Averaging over the window gives the resting voltage, not a random point.
+  float sum = 0.0f;
+  int   mvSum = 0;
+
+  for (int i = 0; i < count; i++) {
+    sum   += batteryVoltage();
+    mvSum += lastReading.mvOnPin;
+
+    // No pause after the last reading: it would just delay the cycle
+    // for nothing. Exactly count-1 pauses, same as in the soil window.
+    if (i < count - 1) delay(gapMs);
+  }
+
+  float v = sum / count;
+  int   p = batteryPercent(v);
+
+  if (smoothedPercent < 0) smoothedPercent = p;
+  else smoothedPercent = smoothedPercent * (1.0f - BATTERY_SMOOTH) + p * BATTERY_SMOOTH;
+
+  lastReading.voltage = v;
+  lastReading.percent = (int)lroundf(smoothedPercent);
+  lastReading.mvOnPin = mvSum / count;
+  return lastReading;
+}
+
+// Pump cell voltage divider ratio: R3/R4 at 1 MΩ each, same as the main one.
+static const float PUMP_DIVIDER = (PUMP_BAT_R1 + PUMP_BAT_R2) / PUMP_BAT_R2;
+
+BatteryReading pumpBatteryWindow(int count, uint32_t gapMs) {
+  if (count < 1) count = 1;
+
+  // ADC resolution is already set in batteryBegin(); attenuation is set per
+  // pin. 11 dB: with a 1:2 voltage divider a full cell gives 2.1 V at the pin.
+  analogSetPinAttenuation(PIN_PUMP_BAT, ADC_11db);
+
+  // Enable the voltage divider only for the duration of the reading. While the bottom of R4 was floating, the midpoint
+  // was pulled up to the cell voltage through R3; after enabling, it settles to
+  // half through 0.5 MΩ on 10 nF (τ = 5 ms), and 50 ms is 10τ.
+  pinMode(PIN_PUMP_BAT_EN, OUTPUT);
+  digitalWrite(PIN_PUMP_BAT_EN, LOW);
+  delay(BATTERY_SETTLE_MS);
+
+  uint32_t mvSum = 0;
+  for (int i = 0; i < count; i++) {
+    uint32_t sum = 0;
+    for (int k = 0; k < BATTERY_SAMPLES; k++) {
+      sum += analogReadMilliVolts(PIN_PUMP_BAT);
+      delayMicroseconds(200);
+    }
+    mvSum += sum / BATTERY_SAMPLES;
+    if (i < count - 1) delay(gapMs);
+  }
+
+  pinMode(PIN_PUMP_BAT_EN, INPUT);        // no pulls: voltage divider is open
+
+  BatteryReading r;
+  r.mvOnPin = mvSum / count;
+  r.voltage = (r.mvOnPin * PUMP_DIVIDER * PUMP_BAT_CALIB) / 1000.0f;
+  r.percent = batteryPercent(r.voltage);
+  return r;
+}
+
+void pollBattery() {
+  static unsigned long last = 0;
+
+  // Its own interval from the battery settings (checkEveryMs), not soilEveryMs:
+  // these are different values with different meanings, and they used to be linked by
+  // oversight — which made the battery log spam at the soil reading rate.
+  if (millis() - last < g_bat.checkEveryMs) return;
+  last = millis();
+
+  // In inactive mode we don't collect a window: loop() must not block for
+  // seconds, or the web server stalls. A single reading with smoothing
+  // is enough here — the page is refreshed manually, accuracy isn't critical.
+  BatteryReading b = batteryRead();
+
+  // A verbal assessment by thresholds — so a problem is visible in the log right away,
+  // not just a number.
+  const char* state = b.voltage <= BATTERY_CRITICAL_VOLTS ? "КРИТИЧНО"
+                    : b.voltage <= BATTERY_LOW_VOLTS      ? "РАЗРЯЖЕНА"
+                    : b.voltage <= BATTERY_WARN_VOLTS     ? "низкий заряд"
+                    : "норма";
+
+  Serial.printf("[BAT] %d%% | %.2f В | на пине %d мВ | %s\n",
+                b.percent, b.voltage, b.mvOnPin, state);
+}
