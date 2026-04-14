@@ -98,3 +98,111 @@ void readingsBegin() {
     // it's the same sector after all. With a mismatched magic the value may also be
     // garbage, so a clearly impossible one (more than the flash endurance)
     // is discarded.
+    uint32_t keepWrites = readable ? blob.writes : 0;
+    if (!valid && keepWrites > NVS_ENDURANCE) keepWrites = 0;
+    blob.magic  = BUFFER_MAGIC;
+    blob.count  = 0;
+    blob.head   = 0;
+    blob.writes = keepWrites;
+    // dirty is NOT set: no point writing an empty buffer to flash, it will
+    // read as empty on the next load anyway.
+  } else if (blob.count > 0) {
+    Serial.printf("Буфер замеров: %d из %d (не отправлено)\n",
+                  blob.count, READINGS_CAPACITY);
+  }
+
+  Serial.printf("Записей в NVS за жизнь платы: %lu (~%d%% от %lu)\n",
+                (unsigned long)blob.writes, readingsWearPercent(),
+                NVS_ENDURANCE);
+}
+
+uint32_t readingsWriteCount() { return blob.writes; }
+
+int readingsWearPercent() {
+  // NVS_ENDURANCE is the rated endurance of a flash sector. Real wear is lower:
+  // NVS spreads writes across the sector (wear leveling), so dividing
+  // the counter directly by endurance is an upper-bound estimate, not an exact number.
+  return (int)((blob.writes * 100ULL) / NVS_ENDURANCE);
+}
+
+void readingsPush(const SoilReadingPayload& r) {
+  int slot;
+
+  if (blob.count < READINGS_CAPACITY) {
+    // There's room — put it right after the last record.
+    slot = (blob.head + blob.count) % READINGS_CAPACITY;
+    blob.count++;
+  } else {
+    // Buffer full: evict the oldest reading. Fresh data is more valuable —
+    // day-old moisture readings no longer decide anything.
+    slot = blob.head;
+    blob.head = (blob.head + 1) % READINGS_CAPACITY;
+    Serial.println("Буфер полон — вытесняю самый старый замер");
+  }
+
+  StoredReading& s = blob.items[slot];
+  s.raw       = (int16_t)r.raw;
+  s.percent   = (int16_t)r.percent;
+  s.minRaw    = (int16_t)r.minRaw;
+  s.maxRaw    = (int16_t)r.maxRaw;
+  s.rssi      = (int16_t)r.rssi;
+  s.bootCount = r.bootCount;
+  s.uptimeSec = r.uptimeSec;
+
+  dirty = true;
+  persist();
+
+  Serial.printf("Замер отложен в буфер: %d из %d\n",
+                blob.count, READINGS_CAPACITY);
+}
+
+int  readingsCount() { return blob.count; }
+bool readingsEmpty() { return blob.count == 0; }
+bool readingsFull()  { return blob.count >= READINGS_CAPACITY; }
+
+int readingsFillBatch(ReportBatch& batch) {
+  int n = blob.count < READINGS_SEND_CHUNK ? blob.count : READINGS_SEND_CHUNK;
+
+  for (int i = 0; i < n; i++) {
+    const StoredReading& s = blob.items[(blob.head + i) % READINGS_CAPACITY];
+
+    SoilReadingPayload r;
+    r.raw       = s.raw;
+    r.percent   = s.percent;
+    r.minRaw    = s.minRaw;
+    r.maxRaw    = s.maxRaw;
+    r.rssi      = s.rssi;
+    r.bootCount = s.bootCount;
+    r.uptimeSec = s.uptimeSec;
+
+    // Voltage isn't stored: it's computed unambiguously from raw, and keeping it
+    // in NVS would mean spending 4 bytes per record for the sake of arithmetic.
+    r.voltage = s.raw * 3.3f / 4095.0f;
+
+    batch.addReading(r);
+  }
+
+  return n;
+}
+
+void readingsDropSent(int n) {
+  if (n <= 0) return;
+  if (n > blob.count) n = blob.count;
+
+  blob.head   = (blob.head + n) % READINGS_CAPACITY;
+  blob.count -= n;
+  dirty = true;
+  persist();
+
+  Serial.printf("Отправлено и удалено из буфера: %d, осталось %d\n",
+                n, blob.count);
+}
+
+void readingsClear() {
+  if (blob.count == 0) return;     // nothing to clear — don't touch flash
+  blob.count = 0;
+  blob.head  = 0;
+  dirty = true;
+  persist();
+  Serial.println("Буфер замеров очищен");
+}
