@@ -88,3 +88,84 @@ bool connectTo(const String& ssid, const String& pass) {
   Serial.printf("Не вышло. Статус: %d\n", st);
 
   WiFi.disconnect(false);           // reset STA so it doesn't interfere with the scan
+  return false;
+}
+
+// ---------- saved network ----------
+
+bool connectSaved() {
+  Preferences prefs;
+  prefs.begin("wifi", true);
+  String s = prefs.getString("ssid", "");
+  String p = prefs.getString("pass", "");
+  prefs.end();
+
+  if (!s.length()) return false;
+
+  Serial.printf("Есть сохранённая сеть «%s», пробую...\n", s.c_str());
+  return connectTo(s, p);
+}
+
+void saveWifiCredentials(const String& ssid, const String& pass) {
+  // We check the write result: this is the only way to get the board back onto the
+  // network after sleep, and a silent failure here would mean "the board forgot
+  // the router forever" without a single line in the logs.
+  //
+  // putString returns the written length (0 on error). For the empty
+  // password of an open network success is indistinguishable from failure (0 == 0), but that
+  // case is covered by ssid: it is written first with the same handle, and a dead NVS
+  // will already fail on it.
+  Preferences prefs;
+  bool ok = prefs.begin("wifi", false);
+  if (ok) {
+    ok = prefs.putString("ssid", ssid) == ssid.length() &&
+         prefs.putString("pass", pass) == pass.length();
+    prefs.end();
+  }
+
+  if (ok) Serial.println("Сеть сохранена во флеш.");
+  else    Serial.println("ОШИБКА: сеть НЕ сохранилась в NVS — после сна "
+                         "плата её не вспомнит!");
+}
+
+void forgetWifi() {
+  Preferences prefs;
+  prefs.begin("wifi", false);
+  prefs.clear();
+  prefs.end();
+  WiFi.disconnect(false);
+  scanCount = -2;                   // the portal will start a fresh scan on visit
+  staStatus = "сеть забыта — выбери новую ниже";
+}
+
+// ---------- access point ----------
+
+void startAP() {
+  WiFi.softAP(AP_SSID, AP_PASS);
+  apOn = true;
+}
+
+void manageAP() {
+  static unsigned long connectedSince = 0;
+  const unsigned long GRACE = 60000;   // 60 s grace period so setup isn't cut off
+
+  bool online = WiFi.status() == WL_CONNECTED;
+  digitalWrite(PIN_LED, online ? HIGH : LOW);   // on = board is on the router's network
+
+  if (online) {
+    if (connectedSince == 0) connectedSince = millis();
+    // enough time has passed and the AP is still on — turn it off
+    if (apOn && millis() - connectedSince > GRACE) {
+      WiFi.softAPdisconnect(true);
+      apOn = false;
+      Serial.println("AP выключен — плата в сети роутера, одно радио.");
+    }
+  } else {
+    connectedSince = 0;
+    // no connection to the router and the AP is off — bring up the fallback entry point
+    if (!apOn) {
+      startAP();
+      Serial.println("Связь потеряна — AP поднят обратно как запасной вход.");
+    }
+  }
+}
