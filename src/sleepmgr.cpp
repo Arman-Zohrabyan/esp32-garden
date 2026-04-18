@@ -78,3 +78,80 @@ void blinkStart() {
 
   // Timer 0, prescaler 80: 80 MHz clock / 80 = 1 MHz, i.e. one
   // tick is a microsecond. Counting in microseconds is convenient and clear.
+  blinkTimer = timerBegin(0, 80, true);
+  timerAttachInterrupt(blinkTimer, &onBlinkTimer, true);
+
+  // Toggle the state every half second — giving a one-second period:
+  // 0.5 s on, 0.5 s off.
+  timerAlarmWrite(blinkTimer, 500000, true);
+  timerAlarmEnable(blinkTimer);
+}
+
+void blinkStop() {
+  if (!blinkTimer) return;
+
+  timerAlarmDisable(blinkTimer);
+  timerDetachInterrupt(blinkTimer);
+  timerEnd(blinkTimer);
+  blinkTimer = nullptr;
+
+  digitalWrite(PIN_LED, LOW);
+}
+
+// ---------- pins during sleep ----------
+//
+// GPIO25 (sensor power) and GPIO26 (voltage divider switch) must be
+// high-impedance during sleep: no pulls and not an output. Any pull on
+// GPIO26 would close the voltage divider and draw current from the cell all sleep, and an output on
+// GPIO25 would keep the sensor powered. rtc_gpio_isolate removes the pulls
+// and holds this state until the next wake-up.
+//
+// Same for the pump unit (firmware 0.4.0): GPIO27 is isolated, and the IRLZ44N
+// switch is held off by its 10 kΩ pull resistor; GPIO33 is isolated, and
+// the pump cell voltage divider is open.
+
+static void sleepPinsIsolate() {
+  digitalWrite(PIN_SOIL_POWER, LOW);        // sensor de-energized
+  pinMode(PIN_SOIL_POWER, INPUT);
+  batteryDividerOff();                      // GPIO26 -> input, voltage divider open
+  digitalWrite(PIN_PUMP, LOW);              // pump off
+  pinMode(PIN_PUMP, INPUT);
+  pinMode(PIN_PUMP_BAT_EN, INPUT);          // pump cell voltage divider open
+  rtc_gpio_isolate((gpio_num_t)PIN_SOIL_POWER);
+  rtc_gpio_isolate((gpio_num_t)PIN_BAT_EN);
+  rtc_gpio_isolate((gpio_num_t)PIN_PUMP);
+  rtc_gpio_isolate((gpio_num_t)PIN_PUMP_BAT_EN);
+}
+
+void sleepPinsRelease() {
+  // The hold survives deep sleep: without this, after wake-up
+  // pinMode/digitalWrite on GPIO25 and GPIO26 silently have no effect — the sensor
+  // won't turn on, the voltage divider won't close. On power-on there is no hold,
+  // and the call is harmless.
+  rtc_gpio_hold_dis((gpio_num_t)PIN_SOIL_POWER);
+  rtc_gpio_hold_dis((gpio_num_t)PIN_BAT_EN);
+  rtc_gpio_hold_dis((gpio_num_t)PIN_PUMP);
+  rtc_gpio_hold_dis((gpio_num_t)PIN_PUMP_BAT_EN);
+
+  // Pump — output LOW immediately, before any other work: the pull on the
+  // gate holds the switch off even without this, but an explicit LOW leaves the pin no chance
+  // to pick up interference while the board boots.
+  pinMode(PIN_PUMP, OUTPUT);
+  digitalWrite(PIN_PUMP, LOW);
+}
+
+void goToSleep(uint32_t seconds) {
+  blinkStop();                      // remove the interrupt before entering sleep
+  digitalWrite(PIN_LED, LOW);       // turn off the LED before sleep
+  sleepPinsIsolate();               // sensor and voltage divider de-energized for the entire sleep
+  Serial.printf("Засыпаю на %lu с (держи BOOT при пробуждении для стопа)\n",
+                (unsigned long)seconds);
+  Serial.flush();                   // let the log reach the port before shutdown
+
+  // Board clock (see clockNow): this cycle's awake time plus sleep. Right
+  // before sleep — after this millis() won't add anything.
+  rtcClockSec += millis() / 1000 + seconds;
+
+  esp_sleep_enable_timer_wakeup((uint64_t)seconds * 1000000ULL);
+  esp_deep_sleep_start();           // we don't return here — the board shuts down
+}
