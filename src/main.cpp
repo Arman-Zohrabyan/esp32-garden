@@ -648,3 +648,341 @@ bool activeCycle() {
   // (it's in g_dev), the whole config must be saved, and the buffer has nothing to do with it.
   if (syncRes.ok() && !g_dev.isActive) {
     Serial.println(">>> Сервер снял активность — выхожу в обычный режим.");
+    markConfigApplied(sync, nullptr);
+    saveDeviceConfig();
+    blinkStop();
+    return false;                            // the regular setup() continues
+  }
+
+  // 6. One batch for the whole cycle. Everything that used to go out in separate requests
+  // (boot, wifi_failed, config_applied, reading, cycle_done) is collected
+  // here and goes out in one report at the end.
+  ReportBatch batch;
+  markConfigApplied(sync, &batch);
+  logBootFailureIfAny(batch, bat.volt);
+  logMissedCycles(batch);
+  logLowBatterySleeps(batch);
+
+  // 7-8. Readings using the current config; see measureReading(). The fresh reading
+  // stays in RAM: it goes into the NVS buffer only if sending fails;
+  // a normal cycle doesn't touch flash.
+  SoilReadingPayload fresh;
+  bool haveFresh = measureReading(batch, fresh);
+
+  // 8a. Auto-watering; see watering.h. With a live sync the board asks the server
+  // before watering, otherwise it waters from the cache. Everything awaiting sending (this and
+  // previous waterings, the check reading, offline skips) goes into the batch.
+  bool watered = autoWaterStep(haveFresh ? fresh.percent : -1, pumpBat,
+                               syncRes.ok(), &batch);
+  WateringSent wateringSent = wateringAddPending(batch);
+
+  // 9. Cycle summary. awake is captured BEFORE sending and printed at the very end
+  // with the same value, as before.
+  uint32_t awake = millis() - cycleStart;
+  logCycleDone(batch, awake, bat, pumpBat, watered);
+  logWearThresholds(batch);
+  uint32_t writesLogged = logNvsWrites(batch);
+
+  // 10. Sending in chunks; see sendBufferedReports(). rep is needed below for
+  // mid-cycle deactivation.
+  ReportOutcome rep;
+  bool batchDelivered;
+  ApiResult repRes = sendBufferedReports(batch, rep,
+                                         haveFresh ? &fresh : nullptr,
+                                         batchDelivered);
+
+  // Waterings and the check reading went out with the first chunk, so they can be removed
+  // from RTC even if one of the later reading chunks didn't get through.
+  if (batchDelivered) wateringMarkDelivered(wateringSent);
+
+  if (repRes.ok()) {
+    // Reset the failure counter only now: if it were reset earlier, a
+    // failed report would lose the information about missed cycles.
+    // The low-cell sleep counter too, for the same reason.
+    rtcFailStreak   = 0;
+    rtcLowBatSleeps = 0;
+
+    // The nvs_write log was delivered: record up to which counter value
+    // usage has been reported. Writes that happened during the send itself (drop
+    // of chunks, push on partial rejection) aren't in the snapshot and will go out
+    // next cycle.
+    rtcWritesReported = writesLogged;
+
+    // Mid-cycle deactivation: while readings were being taken (~20 s), the server may have cleared
+    // activity. Catch it before sleep, not on the next wake-up.
+    if (rep.haveDeviceInfo && !rep.isActive) {
+      Serial.println(">>> Сервер снял активность во время цикла — выхожу в обычный режим.");
+      g_dev.isActive = false;
+      saveDeviceConfig();
+      blinkStop();
+      return false;
+    }
+
+    // The revision changed while the cycle was running. Sleeping on a stale sleepSeconds
+    // isn't a big deal (we'll be off by at most one cycle), but it needs flagging:
+    // the next sync will fetch the current values.
+    if (rep.haveDeviceInfo && rep.revision != g_dev.revision)
+      Serial.printf("Конфиг изменился во время цикла (rev %d -> %d) — заберу на следующем пробуждении\n",
+                    g_dev.revision, rep.revision);
+  } else {
+    // Report failed with Wi-Fi up: that's also a connectivity failure. But if the streak
+    // was already incremented by a sync failure in this same cycle, don't count it again:
+    // it's one missed cycle, not two.
+    if (syncRes.ok()) rtcFailStreak++;
+    Serial.printf("Неудач связи подряд: %lu, буфер: %d из %d\n",
+                  (unsigned long)rtcFailStreak, readingsCount(),
+                  READINGS_CAPACITY);
+
+    // Same safeguard as in the "no Wi-Fi" and "no sync" branches. Without it, a board
+    // with a full buffer and a failing report would spin in the active cycle
+    // forever, evicting one old reading on every wake-up:
+    // sendBufferedReports() has already moved the unsent reading into the buffer, and
+    // the next cycle would start losing data.
+    if (exitToWebIfBufferFull("report не проходит")) return false;
+  }
+
+  Serial.printf("Цикл занял %lu мс\n", (unsigned long)awake);
+
+  // After watering, a short sleep until the check reading, then the normal rhythm.
+  goToSleep(watered ? g_pump.postWaterSleepSeconds
+                    : g_dev.sleepSeconds);   // does not return
+  return true;
+}
+
+void setup() {
+  // Release the hold on the sensor and voltage divider pins left over from sleep, before
+  // any work with them (soilBegin/batteryBegin). See sleepPinsRelease().
+  sleepPinsRelease();
+
+  Serial.begin(115200);
+  delay(500);
+
+  // RTC block first: it may be left over from the previous wake-up or contain
+  // garbage after a power reset.
+  rtcInitIfNeeded();
+  rtcBootCount++;
+
+  // Config from NVS before any logic; everything after works from g_dev / g_soil.
+  // If the server has never responded yet, these will be the defaults from config.h.
+  loadDeviceConfig();
+  loadSoilConfig();
+  loadBatteryConfig();
+  loadPumpConfig();
+  readingsBegin();                      // buffer of unsent readings
+  migrateLegacyCollectFlag();           // one-time migration from collect/on
+
+  g_dev.chipId = chipId();
+
+  Serial.printf("\n=== Загрузка #%lu | причина: %s | fw %s ===\n",
+                (unsigned long)rtcBootCount, resetReasonStr(), FW_VERSION);
+  Serial.printf("chipId: %s | id: %s | active=%s\n",
+                g_dev.chipId.c_str(),
+                g_dev.id.length() ? g_dev.id.c_str() : "(ещё не синхронизировались)",
+                g_dev.isActive ? "да" : "нет");
+  Serial.printf("Почва: dry=%d wet=%d every=%lu avg=%d\n",
+                g_soil.soilDry, g_soil.soilWet,
+                (unsigned long)g_soil.soilEveryMs, g_soil.soilAvgCount);
+  Serial.printf("Автополив: %s | при <= %d%% | %d мл / %.2f мл/с | часы платы %lu с | "
+                "в очереди %lu\n",
+                g_pump.autoWaterEnabled ? "вкл" : "выкл", g_soil.autoWaterPercent,
+                g_pump.waterMl, g_pump.flowMlPerSec, (unsigned long)clockNow(),
+                (unsigned long)rtcWaterQueueLen);
+
+  // Active cycle: if the board is active, it goes to sleep from here and the regular
+  // setup() won't be needed.
+  if (activeCycle()) return;
+
+  pinMode(PIN_LED, OUTPUT);
+  digitalWrite(PIN_LED, LOW);          // off until connected
+
+  // 11 dB = full input range (~0..3.1 V), otherwise the sensor would hit the ceiling
+  soilBegin();                     // ADC input and power pin setup
+  batteryBegin();                  // battery reading on GPIO34
+  readSoilOnce();                  // first value right away so the page isn't empty
+  Serial.printf("Датчик почвы на GPIO%d: %d%% (сырое АЦП: %d)\n",
+                PIN_SOIL, soilPercent, soilRaw);
+
+  WiFi.mode(WIFI_AP_STA);
+  startAP();
+
+  Serial.println("\n=== ТОЧКА ДОСТУПА ===");
+  Serial.printf("Сеть:   %s / %s\n", AP_SSID, AP_PASS);
+  Serial.printf("Адрес:  http://%s\n", WiFi.softAPIP().toString().c_str());
+
+  // Auto-connect to the saved network, if there is one in flash.
+  bool connected = connectSaved();
+
+  // scan the air only if we did NOT connect, i.e. the portal is actually needed.
+  // If connected, the scan starts lazily on the first page visit.
+  if (!connected) startScan();
+
+  webBegin();                      // routes and web server start
+
+  // First sync and boot log, only if the board is on the router's network.
+  // Without a network this is deferred until the first successful connection (see loop).
+  if (connected) syncWithServer();
+}
+
+// First contact after a regular boot: config + boot log.
+//
+// Registration as a separate step is gone: sync with an unknown chipId
+// creates the device on the server itself. Hence there's also no "id is stale, database
+// wiped" branch here: a database wipe is indistinguishable from first power-on.
+void syncWithServer() {
+  static bool bootLogged = false;
+
+  ReportBatch batch;
+  bool ok = syncConfig(&batch);
+
+  // The boot log is sent once per session. resetReason is especially valuable:
+  // BROWNOUT points to weak power, PANIC to a crash that would otherwise go
+  // unseen (the board just reboots).
+  if (!bootLogged && ok) {
+    BatteryReading b = batteryLast();
+    char extra[220];
+    snprintf(extra, sizeof(extra),
+             "\"resetReason\":\"%s\",\"firmwareVersion\":\"%s\",\"freeHeap\":%u,"
+             "\"batteryVolt\":%.2f,\"batteryPct\":%d",
+             resetReasonStr(), FW_VERSION, ESP.getFreeHeap(),
+             b.voltage, b.percent);
+    // BROWNOUT and PANIC are failures, not a routine boot. At info level they
+    // would drown in the stream of normal boots; at error they're visible via a filter.
+    batch.addLog(bootReasonIsFailure() ? "error" : "info", "boot", extra);
+  }
+
+  if (!batch.empty()) {
+    ReportOutcome rep;
+    if (apiReport(g_dev, batch, rep).ok()) bootLogged = true;
+  }
+}
+
+// INACTIVE MODE: heartbeat + config sync every deviceLogsSeconds.
+//
+// Sync goes along with the heartbeat for a reason: this is how the board learns about
+// isActive=true set from the server, and about new settings, without
+// waiting for a reboot.
+void pollHeartbeat() {
+  static unsigned long last = 0;
+  if (WiFi.status() != WL_CONNECTED) return;
+  if (millis() - last < g_dev.deviceLogsSeconds * 1000UL) return;
+  last = millis();
+
+  ReportBatch batch;
+  if (!syncConfig(&batch)) return;
+
+  // The server enabled activity: go to the active cycle without waiting for a
+  // reboot. Save to NVS first, then sleep: otherwise the board would
+  // wake up in a state it doesn't know about itself.
+  if (g_dev.isActive) {
+    Serial.println(">>> Сервер включил активность — перехожу в активный режим.");
+    saveDeviceConfig();
+    batch.addLog("info", "activated", "\"source\":\"server\"");
+    ReportOutcome rep;
+    apiReport(g_dev, batch, rep);
+    delay(200);
+    goToSleep(g_dev.sleepSeconds);        // does not return
+  }
+
+  BatteryReading b = batteryLast();
+  char extra[340];
+  snprintf(extra, sizeof(extra),
+           "\"freeHeap\":%u,\"rssi\":%d,\"ip\":\"%s\",\"isActive\":false,"
+           "\"soilPercent\":%d,\"batteryVolt\":%.2f,\"batteryPct\":%d,"
+           "\"buffered\":%d,\"nvsWrites\":%lu,\"nvsWearPct\":%d",
+           ESP.getFreeHeap(), WiFi.RSSI(),
+           WiFi.localIP().toString().c_str(),
+           soilPercent, b.voltage, b.percent, readingsCount(),
+           (unsigned long)readingsWriteCount(), readingsWearPercent());
+  batch.addLog("info", "heartbeat", extra);
+
+  // Drain the buffer here too. Otherwise a board that dropped into inactive mode
+  // because the buffer overflowed would never send it: the active cycle
+  // with its sending no longer runs, and the accumulated data would be stuck
+  // forever.
+  //
+  // One chunk per heartbeat, not everything at once: inactive mode isn't
+  // in a hurry, and a long series of requests would hang the web server, which in
+  // this mode is the main thing.
+  int n = readingsFillBatch(batch);
+
+  // Unreported NVS usage (e.g. drop of the previous chunk), in the same batch.
+  uint32_t writesLogged = logNvsWrites(batch);
+
+  // Waterings that didn't reach the server while the board was active (e.g.
+  // done offline before dropping into this mode) also go from here.
+  WateringSent wateringSent = wateringAddPending(batch);
+
+  ReportOutcome rep;
+  if (apiReport(g_dev, batch, rep).ok()) {
+    rtcWritesReported = writesLogged;
+    wateringMarkDelivered(wateringSent);
+    if (n > 0) {
+      if (rep.readingsFullyAccepted()) readingsDropSent(n);
+      else Serial.printf("Сервер отверг %d замеров — оставляю в буфере\n",
+                         rep.readingsRejected);
+    }
+  }
+}
+
+// Config sync with the server. MAIN INVARIANT: call BEFORE any
+// actions: readings, sleep, sending. revision can change at any
+// moment, and working with a stale calibration or a stale schedule
+// is not allowed: percentages would be wrong, and sleep the wrong length.
+//
+// batch != nullptr -> the config_applied log goes into it if the config
+// changed. Returns false if the config couldn't be fetched; that's no
+// reason to stop: the caller continues from the NVS cache.
+bool syncConfig(ReportBatch* batch) {
+  // Battery is NOT sent from here, only from the active cycle.
+  //
+  // This path is called every deviceLogsSeconds (currently 10 s), i.e.
+  // 8640 records per day versus 144 in active mode with
+  // sleepSeconds=600; the database would fill up with junk within a day.
+  //
+  // percent stays -1, and by that sign apiSync doesn't add
+  // batteryLogs to the request body at all.
+  BatteryLogPayload bat;
+  BatteryLogPayload pumpBat;
+  pumpBat.type = "pump";
+
+  SyncOutcome sync;
+  ApiResult res = apiSync(g_dev, g_soil, g_bat, g_pump, bat, pumpBat, sync);
+
+  if (!res.ok()) {
+    Serial.printf("Sync не прошёл (%s, код %d) — работаю по кэшу\n",
+                  res.cstr(), res.httpCode);
+    return false;
+  }
+
+  markConfigApplied(sync, batch);
+  return true;
+}
+
+// Retry of the FIRST sync if there was no network at startup. Needed only
+// until the board first reaches the server and gets an id:
+// after that pollHeartbeat() takes over, which syncs every
+// deviceLogsSeconds and survives temporary outages on its own.
+//
+// Hence the exit condition on a non-empty id: it's not "all good now" but
+// "first contact happened, the rest isn't my concern".
+void retrySync() {
+  static unsigned long last = 0;
+  if (WiFi.status() != WL_CONNECTED) return;
+  if (g_dev.id.length()) return;              // first contact already happened
+  if (millis() - last < 60000) return;
+  last = millis();
+  syncWithServer();
+}
+
+void loop() {
+  webLoop();
+  pollScan();
+  retrySync();
+  // auto-scan removed: it's only needed on the setup page, not all the time.
+  // The list refreshes when the portal is opened and via the "Refresh" button.
+
+  manageAP();
+  pollSoil();
+  pollHeartbeat();
+  pollBattery();                   // battery charge, interval = soilEveryMs
+}
