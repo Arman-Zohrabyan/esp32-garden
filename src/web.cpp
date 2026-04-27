@@ -138,3 +138,149 @@ void handleRoot() {
   // Wi-Fi signal level and its verbal rating (online is declared above)
   int rssi = online ? WiFi.RSSI() : 0;
   const char* q = !online ? "нет сети" :
+                  rssi >= -55 ? "отличный" :
+                  rssi >= -67 ? "хороший"  :
+                  rssi >= -75 ? "средний"  : "слабый";
+
+  // temperatureRead() on this core version returns degrees Fahrenheit
+  float tempF     = temperatureRead();
+  float tempF_to_C = (tempF - 32.0f) / 1.8f;
+
+  snprintf(foot, sizeof(foot),
+    "<div class='card'>"
+      "<div class='row'><span>RAM</span><b>%u КБ <i>свободно из %u</i></b></div>"
+      "<div class='row'><span>DISC</span><b>%u КБ <i>свободно из %u</i></b></div>"
+      "<div class='row'><span>Аптайм</span><b>%s</b></div>"
+      "<div class='row'><span>Сигнал Wi-Fi</span><b>%d dBm <i>%s</i></b></div>"
+      "<div class='row'><span>Температура <i>(макс 85°)</i></span>"
+      "<b>%.1f °C <i>= %.0f °F</i></b></div>"
+    "</div>"
+    "<div class='foot'>RAM — оперативка, меняется в реальном времени · "
+    "DISC — флеш: прошивка занимает %u КБ · "
+    "сигнал: ближе к 0 — лучше · "
+    "температура кристалла грубая и неточная</div>"
+    "</body></html>",
+    ESP.getFreeHeap() / 1024, ESP.getHeapSize() / 1024,
+    (partSz - sketch) / 1024, partSz / 1024,
+    up, rssi, q,
+    tempF_to_C, tempF,
+    sketch / 1024);
+  server.sendContent(foot);
+  server.sendContent("");
+
+  uint32_t after = ESP.getFreeHeap();
+  Serial.printf("Запрос #%d | heap до: %u после: %u дельта: %+d | мин: %u\n",
+                ++reqNum, before, after, (int)after - (int)before,
+                ESP.getMinFreeHeap());
+}
+
+void handleSave() {
+  String ssid = server.arg("ssid");
+  String pass = server.arg("pass");
+
+  server.send(200, "text/html", F(
+    "<!DOCTYPE html><html><head><meta charset='utf-8'>"
+    "<meta http-equiv='refresh' content='20;url=/'>"
+    "<style>body{font-family:system-ui;background:#161616;color:#eee;"
+    "padding:2rem;text-align:center}</style></head><body>"
+    "<h3>Подключаюсь...</h3><p>Страница обновится сама через 20 секунд.</p>"
+    "<p style='color:#888;font-size:.85rem'>Сеть ESP32-Garden продолжает "
+    "работать — если пароль неверный, просто попробуй снова.</p></body></html>"));
+
+  if (connectTo(ssid, pass)) saveWifiCredentials(ssid, pass);
+  startScan();                      // refresh the list after the attempt
+}
+
+
+// ---------- routes ----------
+
+void webBegin() {
+  server.on("/", handleRoot);
+  server.on("/save", HTTP_POST, handleSave);
+  server.on("/rescan", []() {
+    WiFi.scanDelete();
+    scanCount = -2;
+    startScan();
+    server.sendHeader("Location", "/");
+    server.send(303);
+  });
+  server.on("/forget", []() {
+    forgetWifi();
+    server.sendHeader("Location", "/");
+    server.send(303);
+  });
+  // Device activation. The only path for isActive false -> true:
+  // by protocol only the device itself can turn itself on, and only
+  // locally — after confirmation by a human on this page.
+  server.on("/activate", []() {
+    // A UUID is required: PUT /devices/:id is the only route that goes by
+    // id rather than chipId. The id arrives in the sync response, so an empty field
+    // means the board has never once reached the server.
+    if (!g_dev.id.length()) {
+      server.send(200, "text/html", F(
+        "<!DOCTYPE html><html><head><meta charset='utf-8'>"
+        "<meta http-equiv='refresh' content='5;url=/'>"
+        "<style>body{font-family:system-ui;background:#161616;color:#eee;"
+        "padding:2rem;text-align:center}b{color:#f87171}</style></head><body>"
+        "<h3><b>Нет связи с сервером</b></h3>"
+        "<p style='color:#888;font-size:.85rem'>Плата ещё не синхронизировалась — "
+        "сначала нужно подключиться к сети роутера.</p>"
+        "</body></html>"));
+      return;
+    }
+
+    // ORDER MATTERS: first the server, then NVS, then sleep.
+    // If we save locally and go to sleep but the server never learns about it, it
+    // will never send isActive=false — and the board could then be woken
+    // only with the BOOT button.
+    //
+    // Specifically PUT, not sync: for an already known device the server's
+    // isActive always overrides what the board sends in the sync body,
+    // so it can't turn itself on via sync — only via this route.
+    ApiResult res = apiPutIsActive(g_dev, true);
+
+    if (!res.ok()) {
+      char page[700];
+      snprintf(page, sizeof(page),
+        "<!DOCTYPE html><html><head><meta charset='utf-8'>"
+        "<meta http-equiv='refresh' content='5;url=/'>"
+        "<style>body{font-family:system-ui;background:#161616;color:#eee;"
+        "padding:2rem;text-align:center}b{color:#f87171}</style></head><body>"
+        "<h3><b>Не удалось активировать</b></h3>"
+        "<p style='color:#888;font-size:.85rem'>Сервер не ответил (%s, код %d). "
+        "Плата осталась в обычном режиме — попробуй ещё раз.</p>"
+        "</body></html>", res.cstr(), res.httpCode);
+      server.send(200, "text/html", page);
+      Serial.printf(">>> Активация НЕ прошла: %s (%d)\n", res.cstr(), res.httpCode);
+      return;
+    }
+
+    // The server accepted — now it's safe to commit locally.
+    saveIsActive(true);
+
+    char page[900];
+    snprintf(page, sizeof(page),
+      "<!DOCTYPE html><html><head><meta charset='utf-8'>"
+      "<style>body{font-family:system-ui;background:#161616;color:#eee;"
+      "padding:2rem;text-align:center}b{color:#4ade80}</style></head><body>"
+      "<h3>▶ Устройство активировано</h3>"
+      "<p>Цикл: <b>%d замеров</b> с паузой <b>%lu мс</b> → отправка → "
+      "сон <b>%lu с</b>.</p>"
+      "<p style='color:#888;font-size:.85rem'>Дашборд недоступен во сне. "
+      "Остановить: выключить с сервера либо держать кнопку <b>BOOT</b> "
+      "на плате, пока она просыпается.</p></body></html>",
+      g_soil.soilAvgCount, (unsigned long)g_soil.soilEveryMs,
+      (unsigned long)g_dev.sleepSeconds);
+    server.send(200, "text/html", page);
+
+    delay(300);                       // let the page reach the browser
+    Serial.println("\n>>> Устройство активировано. Ухожу в deep sleep.");
+    goToSleep(g_dev.sleepSeconds);    // doesn't return; powers down the sensor and voltage divider
+  });
+  server.onNotFound([]() { server.send(404, "text/plain", ""); });
+  server.begin();
+}
+
+void webLoop() {
+  server.handleClient();
+}
