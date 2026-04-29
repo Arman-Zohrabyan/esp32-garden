@@ -398,3 +398,443 @@ Log entry shape, as submitted in the `logs` array of `report`:
 ---
 
 ##### Format conventions
+
+- **Keep a common envelope on every entry:** `chipId`, `level`, `event`, `uptimeSec`. A schemaless jsonb column turns into an unqueryable dump fast without at least this much consistency.
+- **`event` is a machine identifier, not prose.** Use `"wifi_failed"`, not `"WiFi reconnect failed"` — the former is filterable/groupable in a query, the latter isn't.
+- **`level`** — one of `"info"`, `"warn"`, `"error"`.
+
+##### What to log — by purpose
+
+**Heartbeat** (while `isActive === false`, every `deviceLogsSeconds`):
+```json
+{
+  "info": {
+    "chipId": "8C94DF8B7EF8",
+    "level": "info",
+    "event": "heartbeat",
+    "uptimeSec": 184,
+    "freeHeap": 214560,
+    "rssi": -52,
+    "ip": "192.168.11.82",
+    "isActive": false,
+    "nvsWrites": 0,
+    "nvsWearPct": 0
+  }
+}
+```
+`nvsWrites`/`nvsWearPct` — see [NVS wear tracking](#nvs-wear-tracking) below.
+
+**Errors — the most important category.** This is the entire reason the log endpoint exists: without it, a device that fails silently and goes back to sleep leaves no trace of why data stopped arriving.
+
+- Wi-Fi connect failure:
+  ```json
+  {"info": {"chipId": "…", "level": "error", "event": "wifi_failed",
+    "ssid": "TEAM_COSMO-7E36", "status": 6, "waitedMs": 10000}}
+  ```
+- Ping/HTTP failure:
+  ```json
+  {"info": {"chipId": "…", "level": "error", "event": "ping_failed",
+    "httpCode": -1, "error": "connection refused", "url": "…"}}
+  ```
+- Sensor disconnected (e.g. raw reading pinned at the ADC ceiling with no spread):
+  ```json
+  {"info": {"chipId": "…", "level": "error", "event": "sensor_disconnected",
+    "raw": 4095, "minRaw": 1200, "maxRaw": 4095, "spread": 2895}}
+  ```
+
+**Boot / reset diagnostics.** The single most-overlooked category, and usually the one that explains the strangest bugs. `esp_reset_reason()` tells you *why* the board restarted:
+
+| `esp_reset_reason_t` | Meaning |
+|---|---|
+| `ESP_RST_DEEPSLEEP` | normal wake from deep sleep — expected |
+| `ESP_RST_PANIC` | firmware crash |
+| `ESP_RST_BROWNOUT` | power sag — undersized supply/battery |
+| `ESP_RST_WDT` | hang, watchdog fired |
+
+```json
+{"info": {"chipId": "…", "level": "warn", "event": "boot",
+  "resetReason": "BROWNOUT", "bootCount": 47, "firmwareVersion": "1.2.0"}}
+```
+A `BROWNOUT` on a battery-powered device is a direct signal of insufficient power — without this log, all you'd observe is "the board restarts sometimes."
+
+**Power and memory** (battery-powered devices — log every active cycle):
+```json
+{"info": {"chipId": "…", "event": "cycle_done",
+  "freeHeap": 214560, "minFreeHeap": 198004,
+  "batteryMv": 3720, "awakeMs": 4200,
+  "nvsWrites": 0, "nvsWearPct": 0}}
+```
+`awakeMs` is the key battery-life metric — how long the device stayed awake this cycle. A creeping value (e.g. Wi-Fi taking longer to associate over time) is an early warning the battery will drain faster than expected. `minFreeHeap` catches slow memory leaks. `nvsWrites`/`nvsWearPct` — see [NVS wear tracking](#nvs-wear-tracking) below.
+
+**Low-battery sleep** (firmware 0.3.0+). Below 3.45 V the active cycle does not turn Wi-Fi on — the transmitter's current peaks would sag the cell into a brownout — and sleeps 12 h instead, until the cell is back above 3.6 V (i.e. charged). Those wakes can't report anything, so once the device is back online it sends one log with how many such sleeps happened:
+```json
+{"info": {"chipId": "…", "level": "warn", "event": "battery_low_sleep",
+  "sleeps": 3, "sleepSeconds": 43200, "lowVolts": 3.45, "resumeVolts": 3.60}}
+```
+
+**Config applied** — confirms a revision was actually applied on-device, not just written to the DB:
+```json
+{"info": {"chipId": "…", "event": "config_applied",
+  "revision": 7, "prevRevision": 6,
+  "changed": {"sleepSeconds": [50, 600], "isActive": [false, true]}}}
+```
+
+##### NVS wear tracking
+
+`nvsWrites`/`nvsWearPct` (present on `heartbeat` and `cycle_done`) track cumulative writes to NVS flash over the board's lifetime, since flash cells have a finite erase/write endurance — repeatedly writing a buffered-readings block (e.g. the retry queue used to survive a failed upload, see [`bootCount` — wake correlation](#bootcount--wake-correlation)) is the main thing that would consume it.
+
+| Field | Type | Notes |
+|---|---|---|
+| `nvsWrites` | int | cumulative NVS write count over the board's lifetime |
+| `nvsWearPct` | int | `nvsWrites / endurance × 100`, rounded — endurance is a fixed constant (`100000` writes), not per-board measured |
+
+`0` is the expected steady-state value while the device stays within a normal cycle: the retry buffer only gets written when an upload actually fails, so a healthy board accumulates writes rarely, not every cycle.
+
+In addition to the running counts on every `heartbeat`/`cycle_done`, a dedicated **`nvs_wear`** event fires once when cumulative wear crosses the 50/80/90/95% thresholds — not on every cycle past that point, to avoid spamming the log once a board is in its wear-out phase:
+
+```json
+{"info": {"chipId": "…", "level": "error", "event": "nvs_wear",
+  "nvsWrites": 80000, "nvsWearPct": 80, "threshold": 80,
+  "endurance": 100000,
+  "note": "upper-bound estimate, wear leveling not accounted for"}}
+```
+`level` is `"warn"` below 80% and `"error"` at 80% and above. Each threshold fires only once per board lifetime — firmware tracks which thresholds have already been reported in RTC memory (`rtcWearReported`), not flash, since persisting that state to NVS would itself consume the write endurance being tracked. A `bootCount`-only power loss (not `erase_flash`) resets RTC state, so a threshold could in principle re-fire after a battery pull even though the underlying wear didn't reverse — this is a known tradeoff of not persisting the reported-set to flash.
+
+---
+
+### 3.5 Battery tracking — `/battery`, `/battery-logs`, `/battery-normalization`
+
+A **battery** represents a physical battery pack that powers either an ESP32 board or a pump, identified by `type`. Every battery is tied to the device it powers via `deviceChipId` (FK to `devices.chipId`).
+
+> **Provisioning is automatic; config and logging are live; calibration is manual.** Two `Battery` rows — one `esp32`, one `pump` — are created automatically the moment a `Device` is created, whether via [`sync`](#post-devicesby-chipchipidsync)'s first-contact path or `POST /devices`; there's no separate battery-creation step for firmware to worry about. Voltage/percentage logging (`battery_logs`) is firmware-integrated for both batteries, submitted as part of `sync`'s `batteryLogs` array — `esp32` since firmware 0.3.0, `pump` since 0.4.0. `checkEveryMs`/`checkAvgCount` **are** read by firmware — every `sync` response includes a `batteries[]` array with each battery's current values, applied fresh each cycle (no revision/confirm sync like `Device`/`SoilSettings` — the device just reads the latest value every time, there's nothing to "confirm applying"). `batteryAlertPercent` and `battery_normalization` (calibration pairs) remain purely manual — nothing reads either of them yet; they're just stored via this section's full CRUD routes for when alerting/calibration logic is built.
+>
+> **Hardware note:** the ESP32's own battery voltage is read on **GPIO34** (ADC1_CH6) through a 1 MΩ + 1 MΩ divider with 10 nF from the midpoint to GND. Since firmware 0.3.0 the divider's low side goes to **GPIO26** (`PIN_BAT_EN`) instead of GND: firmware drives it LOW while awake to enable the divider and leaves it a floating input during deep sleep, so the divider draws no current while the board sleeps. A reading below 2.5 V (jumper J2 removed) or above 4.5 V (divider not enabled) is treated as invalid and not sent.
+>
+> The pump's cell (`type: "pump"`, firmware 0.4.0+) has a copy of that divider (R3/R4 1 MΩ, 10 nF, jumper J5): midpoint on **GPIO35** (ADC1_CH7, `PIN_PUMP_BAT`), low side on **GPIO33** (`PIN_PUMP_BAT_EN`). Unlike the main divider it is switched on only for the measurement window itself (`checkAvgCount` × `checkEveryMs` of the `pump` row) and off right after, so the divider takes nothing from the pump cell the rest of the time.
+
+#### `GET /battery`
+List all batteries, newest first.
+
+**Response 200** — `Battery[]`
+
+#### `GET /battery/:id`
+Fetch a single battery by its numeric `id`.
+
+**Path params:** `id` (integer)
+
+**Response 200** — `Battery`
+**Response 404** — if no battery has that `id`
+
+#### `POST /battery`
+Create a battery record by hand — normally unnecessary, since a device's two `Battery` rows are provisioned automatically (see above). Useful mainly for adjusting a battery's config before the device it belongs to has ever synced, or for re-creating a row that was deleted.
+
+**Body** (`Partial<Battery>`):
+```json
+{
+  "type": "esp32",
+  "deviceChipId": "8C94DF8B7EF8"
+}
+```
+| Field | Type | Required | Notes |
+|---|---|---|---|
+| `type` | `"esp32"` \| `"pump"` | yes | `"esp32"` = the cell powering the board, `"pump"` = the pump's separate cell |
+| `deviceChipId` | string | yes | FK to `devices.chipId`; the device this battery powers |
+| `checkEveryMs` | int | no | defaults to `400` |
+| `checkAvgCount` | int | no | defaults to `10` |
+| `batteryAlertPercent` | int | no | defaults to `30` |
+
+**Response 201** — created `Battery` (with generated `id` and defaults applied for any omitted field)
+
+#### `PUT /battery/:id`
+Update a battery. Plain field merge — no revision bump, since there's no device to sync this to yet.
+
+**Path params:** `id` (integer)
+
+**Body** — any subset of `Battery` fields.
+
+**Response 200** — updated `Battery`
+**Response 404** — if `id` not found
+
+#### `DELETE /battery/:id`
+Delete a battery. Cascades to its `battery_logs` and `battery_normalization` rows.
+
+**Path params:** `id` (integer)
+
+**Response 200**
+**Response 404** — if `id` not found
+
+---
+
+#### `GET /battery-logs`
+List battery voltage/percentage log entries, newest first.
+
+**Query params:** `batteryId` (optional, integer) — when provided, scopes the list to that battery only; omit to list across all batteries.
+
+**Response 200** — `BatteryLog[]`
+
+#### `POST /battery-logs`
+Submit a battery log entry directly by `batteryId`. This exists for manual/admin use (e.g. backfilling a reading taken by hand) — the ESP32 itself submits its `esp32`-battery readings through [`sync`](#post-devicesby-chipchipidsync)'s `batteryLogs` array instead, addressed by `(chipId, type)` rather than a raw `batteryId`.
+
+**Body:**
+```json
+{
+  "batteryId": 1,
+  "volt": 3.7,
+  "percentage": 82
+}
+```
+| Field | Type | Required | Notes |
+|---|---|---|---|
+| `batteryId` | integer | yes | FK to `battery.id` |
+| `volt` | number | yes | measured voltage |
+| `percentage` | integer | yes | battery percentage (computed however the caller sees fit — the server does no computation) |
+
+**Response 201** — created `BatteryLog`
+
+No `PUT`/`PATCH`/`DELETE` — this is an append-only log, matching the `soil-readings`/`device-logs` pattern.
+
+---
+
+#### `GET /battery-normalization`
+List multimeter-vs-ADC calibration pairs.
+
+**Query params:** `batteryId` (optional, integer) — same filtering behavior as `GET /battery-logs`.
+
+**Response 200** — `BatteryNormalization[]`
+
+#### `GET /battery-normalization/:id`
+Fetch a single calibration pair by its numeric `id`.
+
+**Response 200** — `BatteryNormalization`
+**Response 404** — if no row has that `id`
+
+#### `POST /battery-normalization`
+Record a calibration pair: a voltage measured by hand with a multimeter, paired with the raw ADC value the ESP32 read for the same battery at the same moment. This is used to build a more accurate voltage/percentage curve than trusting the ESP32's raw ADC reading alone (ADC readings on the ESP32 are known to be somewhat noisy/non-linear without calibration).
+
+**Body:**
+```json
+{
+  "batteryId": 1,
+  "multimeterValue": 3.71,
+  "esp32Value": 2650
+}
+```
+| Field | Type | Required | Notes |
+|---|---|---|---|
+| `batteryId` | integer | yes | FK to `battery.id` |
+| `multimeterValue` | number | yes | ground-truth voltage, measured by hand |
+| `esp32Value` | integer | yes | raw ADC value the ESP32 reported at the same time |
+
+**Response 201** — created `BatteryNormalization`
+
+#### `PUT /battery-normalization/:id`
+Update a calibration pair.
+
+**Body** — any subset of `BatteryNormalization` fields.
+
+**Response 200** — updated `BatteryNormalization`
+**Response 404** — if `id` not found
+
+#### `DELETE /battery-normalization/:id`
+Delete a calibration pair.
+
+**Response 200**
+**Response 404** — if `id` not found
+
+---
+
+### 3.6 Auto-watering — pump settings, waterings
+
+Firmware 0.4.0+. The pump runs from its **own** cell (TP4056 No. 2 → MT3608 boost at 5 V → pump), switched on the low side by an IRLZ44N whose gate is driven from **GPIO27** (`PIN_PUMP`, 100 Ω series, 10 kΩ gate pull-down keeps it off while the pin floats). With the key open the boost module is unpowered, so the pump cell gives nothing outside of watering.
+
+**The cycle:** soil measurement ≤ `soil_settings.autoWaterPercent` → board-side checks (pump cell reading valid and ≥ `minBatteryVolt`, fewer than `maxWateringsPerDay` waterings in its own 24 h memory) → [`POST .../watering`](#post-devicesby-chipchipidwatering) → pump for `ml / flowMlPerSec` s (≤ `maxPumpSeconds`) → `report.waterings[]` → deep sleep `postWaterSleepSeconds` → the next wake measures again and sends `moistureAfter` (and never waters itself) → back to `devices.sleepSeconds`. A skipped watering is logged as `watering_skipped` (`reason` = one of the server reasons, or `pump_battery_invalid`).
+
+**Offline:** with no Wi-Fi or no server the board waters on its cached (NVS) pump settings, queues the record in RTC memory (`offline: true`) and reports it later with `agoSec`; skips made offline arrive as one `watering_skipped` log with `offline: true, count, lastReason`. Holding BOOT for ~50 ms while the pump runs stops it early (`stoppedByButton` in the `watering` log).
+
+#### `GET /devices/:deviceId/pump-settings`
+**Response 200** — `PumpSettings` (see [4.8](#48-pump_settings)). A device that predates pump settings gets its row created with the defaults on this first read. **404** for an unknown or malformed `deviceId`.
+
+#### `PUT /devices/:deviceId/pump-settings`
+Dashboard-facing. Bumps `revision`; the board confirms via `sync`'s `pump.appliedRevision`. Only these fields are accepted (anything else in the body is ignored), and out-of-range values are rejected with **400**:
+
+| Field | Range |
+|---|---|
+| `autoWaterEnabled` | boolean |
+| `waterMl` | 10–2000 |
+| `flowMlPerSec` | 1–200 |
+| `postWaterSleepSeconds` | 60–86400 |
+| `maxWateringsPerDay` | 1–8 |
+| `minBatteryVolt` | 3.0–4.2 |
+| `maxPumpSeconds` | 1–300 |
+
+#### `GET /devices/:deviceId/waterings`
+Watering history, newest first (by `wateredAt`). Query: `limit` (default 50, max 1000), `offset`. **Response 200:** `{ items: WateringLog[], total, limit, offset, hasMore }`.
+
+---
+
+## 4. Database schema
+
+Postgres, via TypeORM. Schema is auto-synced from entities outside of production (no migrations exist yet), so this reflects the live schema.
+
+### 4.1 `devices`
+
+| Column | Type | Nullable | Default | Notes |
+|---|---|---|---|---|
+| `id` | uuid (PK) | no | generated | |
+| `chipId` | varchar | no | — | **unique**; MAC-derived identifier reported by firmware (12 hex chars, no separators) |
+| `name` | varchar | yes | null | human-friendly label |
+| `lastSeenAt` | timestamptz | yes | null | updated on every `sync` and `report` (never by dashboard `PUT`) |
+| `lastIp` | inet | yes | null | updated on `sync` when `device.lastIp` is provided |
+| `firmwareVersion` | varchar | yes | null | reported by device; no OTA mechanism exists |
+| `sleepSeconds` | int | no | `50` | deep-sleep interval; changing bumps `revision` |
+| `isActive` | boolean | no | `false` | see [isActive — ownership and behavior](#isactive--ownership-and-behavior); changing bumps `revision` |
+| `deviceLogsSeconds` | int | no | `300` | heartbeat interval for the `report`-submitted heartbeat log, used **only** while `isActive` is not `true`; editable from the dashboard via `PUT /devices/:id` |
+| `revision` | int | no | `1` | server-owned config version counter |
+| `appliedRevision` | int | yes | null | last revision the device confirmed applying |
+| `createdAt` | timestamptz | no | now() | |
+| `updatedAt` | timestamptz | no | now() | auto-updated on save |
+
+### 4.2 `soil_settings`
+
+| Column | Type | Nullable | Default | Notes |
+|---|---|---|---|---|
+| `id` | uuid (PK) | no | generated | |
+| `deviceId` | uuid (FK → `devices.id`, `ON DELETE CASCADE`, **UNIQUE**) | no | — | exactly one settings row per device, DB-enforced |
+| `soilDry` | int | no | `3050` | raw ADC value representing fully dry soil |
+| `soilWet` | int | no | `900` | raw ADC value representing fully wet soil |
+| `soilEveryMs` | int | no | `400` | sampling interval in ms |
+| `soilAvgCount` | int | no | `10` | number of samples to average per reading |
+| `dryAlertPercent` | int | no | `30` | threshold to trigger a "too dry" alert |
+| `autoWaterPercent` | int | no | `20` | auto-watering trigger: the board runs the pump at or below this moisture (firmware 0.4.0+) |
+| `revision` | int | no | `1` | bumped on every human/API update |
+| `appliedRevision` | int | yes | null | last revision the device confirmed applying |
+| `updatedAt` | timestamptz | no | now() | |
+
+### 4.3 `soil_readings`
+
+| Column | Type | Nullable | Default | Notes |
+|---|---|---|---|---|
+| `id` | bigint (PK) | no | auto-increment | |
+| `deviceId` | uuid (FK → `devices.id`, `ON DELETE CASCADE`) | no | — | indexed together with `recordedAt` (see below) |
+| `raw` | int | no | — | raw ADC reading, **averaged on-device over `soilAvgCount` samples** (from that device's `SoilSettings`) before submission |
+| `percent` | smallint | **yes** | null | moisture percentage computed from the averaged `raw` value; nullable so a failed/skipped computation doesn't block submitting the reading |
+| `voltage` | real | no | — | sensor voltage, also from the averaged sample |
+| `minRaw` | int | no | — | calibration min at time of reading |
+| `maxRaw` | int | no | — | calibration max at time of reading |
+| `rssi` | smallint | **yes** | null | WiFi signal strength (dBm); nullable so a missing/failed RSSI read doesn't block submitting the reading |
+| `uptimeSec` | int | no | — | device uptime in seconds at time of reading |
+| `bootCount` | int | **yes** | null | device's RTC wake counter — see [`bootCount` — wake correlation](#bootcount--wake-correlation); nullable for rows predating this column |
+| `recordedAt` | timestamptz | no | now() | server-set on insert |
+
+**Indexes:** composite `(deviceId, recordedAt)` — matches the access pattern of `GET /devices/:deviceId/soil-readings` (filter by device, sort by time descending). Also `(deviceId, bootCount)` — `bootCount` is only unique per-device, not globally, so it's always queried/indexed scoped to a `deviceId`.
+
+### 4.4 `device_logs`
+
+| Column | Type | Nullable | Default | Notes |
+|---|---|---|---|---|
+| `id` | int (PK) | no | auto-increment | |
+| `deviceId` | uuid (FK → `devices.id`, `ON DELETE CASCADE`, indexed) | no | — | |
+| `bootCount` | int | **yes** | null | device's RTC wake counter — see [`bootCount` — wake correlation](#bootcount--wake-correlation); nullable since a log may not originate from a device wake cycle, and rows predating this column have none |
+| `createdAt` | timestamptz | no | now() | |
+| `info` | jsonb | no | — | freeform payload — see [event catalog](#format-conventions) in 3.4 for recommended shape |
+
+**Index:** composite `(deviceId, bootCount)`, same rationale as `soil_readings` above.
+
+### 4.5 `battery`
+
+| Column | Type | Nullable | Default | Notes |
+|---|---|---|---|---|
+| `id` | int (PK) | no | auto-increment | |
+| `type` | enum (`esp32`, `pump`) | no | — | `esp32` = the cell powering the board, `pump` = the pump's separate cell (measured since firmware 0.4.0) |
+| `deviceChipId` | varchar (FK → `devices.chipId`, `ON DELETE CASCADE`) | no | — | the device this battery powers |
+| `checkEveryMs` | int | no | `400` | interval between battery checks; read fresh by firmware every `sync` call |
+| `checkAvgCount` | int | no | `10` | number of samples to average per check; read fresh by firmware every `sync` call |
+| `batteryAlertPercent` | int | no | `30` | low-battery alert threshold; not yet read by anything |
+| `createdAt` | timestamptz | no | now() | |
+| `updatedAt` | timestamptz | no | now() | auto-updated on save |
+
+### 4.6 `battery_logs`
+
+| Column | Type | Nullable | Default | Notes |
+|---|---|---|---|---|
+| `id` | int (PK) | no | auto-increment | |
+| `batteryId` | int (FK → `battery.id`, `ON DELETE CASCADE`, indexed) | no | — | |
+| `volt` | real | no | — | measured voltage |
+| `percentage` | smallint | no | — | battery percentage |
+| `createdAt` | timestamptz | no | now() | server-set on insert |
+
+### 4.7 `battery_normalization`
+
+| Column | Type | Nullable | Default | Notes |
+|---|---|---|---|---|
+| `id` | int (PK) | no | auto-increment | |
+| `batteryId` | int (FK → `battery.id`, `ON DELETE CASCADE`, indexed) | no | — | |
+| `multimeterValue` | real | no | — | ground-truth voltage measured by hand with a multimeter |
+| `esp32Value` | int | no | — | raw ADC value the ESP32 read at the same moment |
+
+Used to build a more accurate voltage/percentage curve for a battery than trusting its raw ESP32 ADC readings alone — pair up a hand-measured multimeter reading with the corresponding raw ADC value at the same point in time, and accumulate enough pairs to fit a proper calibration curve.
+
+### 4.8 `pump_settings`
+
+| Column | Type | Nullable | Default | Notes |
+|---|---|---|---|---|
+| `id` | uuid (PK) | no | generated | |
+| `deviceId` | uuid (FK → `devices.id`, `ON DELETE CASCADE`, **UNIQUE**) | no | — | one row per device |
+| `autoWaterEnabled` | boolean | no | `true` | master switch |
+| `waterMl` | int | no | `350` | dose per watering |
+| `flowMlPerSec` | real | no | `26.67` | pump output at 5 V; measured 1000 ml in 37.5 s |
+| `postWaterSleepSeconds` | int | no | `600` | deep sleep after a watering, before the control measurement |
+| `maxWateringsPerDay` | int | no | `3` | rolling 24 h limit |
+| `minBatteryVolt` | real | no | `3.3` | no watering below this pump cell voltage |
+| `maxPumpSeconds` | int | no | `60` | cap on one pump run |
+| `revision` | int | no | `1` | bumped on every dashboard update |
+| `appliedRevision` | int | yes | null | last revision the board confirmed applying |
+| `updatedAt` | timestamptz | no | now() | |
+
+### 4.9 `watering_logs`
+
+| Column | Type | Nullable | Default | Notes |
+|---|---|---|---|---|
+| `id` | bigint (PK) | no | auto-increment | |
+| `deviceId` | uuid (FK → `devices.id`, `ON DELETE CASCADE`) | no | — | |
+| `nonce` | bigint | no | — | the board's random id for the watering; dedup key for resends, match key for `wateringsAfter` |
+| `bootCount` | int | yes | null | wake that ran the pump |
+| `ml` | int | no | — | dose asked for |
+| `seconds` | real | no | — | how long the pump actually ran |
+| `flowMlPerSec` | real | yes | null | flow used for the calculation |
+| `moistureBefore` / `moistureAfter` | smallint | yes | null | trigger moisture / moisture after the post-watering sleep |
+| `pumpBatteryVolt` | real | yes | null | pump cell before the run |
+| `offline` | boolean | no | `false` | watered on cached settings |
+| `wateredAt` | timestamptz | no | — | when the pump ran (`now − agoSec`) |
+| `createdAt` | timestamptz | no | now() | when the server received it |
+
+**Indexes:** `(deviceId, wateredAt)` for the history and the 24 h count, `(deviceId, nonce)` for dedup/matching.
+
+---
+
+## 5. Typical ESP32 firmware flow
+
+1. **Start of every wake cycle:** call `POST /devices/by-chip/:chipId/sync` with `{ device: { lastIp, appliedRevision, isActive }, soil: { appliedRevision }, batteryLogs? }` — see [`sync`](#post-devicesby-chipchipidsync). This single call handles first-contact registration (unknown `chipId`), the config heartbeat, the soil-settings fetch, both revision confirms, battery-log submission, and battery-config fetch all at once — there's no separate register/ping/soil-settings-GET/confirm/battery-config sequence anymore.
+   - The response always contains the full `device` and `soil` objects, plus `batteries[]`. Diff `device.revision`/`soil.revision` against what was last applied; if either changed, apply the new values (`sleepSeconds`/`isActive`/`deviceLogsSeconds` from `device`, `soilDry`/`soilWet`/etc. from `soil`) and store the new revision numbers. The corresponding `appliedRevision` is sent back on a *later* `sync` call, once applied — there's no separate confirm request. `batteries[]` (each battery's `checkEveryMs`/`checkAvgCount`) has no revision to track — just apply the latest values every cycle.
+   - **Check `isActive` before doing anything else this cycle** (see [isActive — ownership and behavior](#isactive--ownership-and-behavior)). Treat anything other than `isActive === true` as inactive:
+     - **Inactive:** skip sleep/measurement entirely; submit a heartbeat log (no `readings`) via `report` every `deviceLogsSeconds` seconds and loop.
+     - **Active:** proceed with the normal flow below.
+2. **After each sensor sample, and/or whenever there's a log to send:** call `POST /devices/by-chip/:chipId/report` with `{ readings?: [...], logs?: [...] }` — see [`report`](#post-devicesby-chipchipidreport). Both arrays are optional; send whichever ones have data this cycle (a sensor-disconnected cycle sends only `logs`, a normal cycle sends one reading in `readings` plus a `cycle_done` log, a retry-recovery cycle can resend a buffered reading alongside a fresh one). Include `bootCount` on each entry — see [`bootCount` — wake correlation](#bootcount--wake-correlation).
+   - Check the response's `readings.rejected`/`logs.rejected` counts before clearing any RTC-buffered retry data — only drop the buffer once the corresponding count is `0`.
+   - Check the response's `device.isActive`/`device.revision` — if `isActive` has flipped to `false` or `revision` has moved since the last `sync`, treat it as a mid-cycle deactivation/config change rather than waiting for the next wake to notice.
+3. **On boot, errors, or while inactive:** include a log entry in `report`'s `logs` array — `{ info: { chipId, level, event, ... }, bootCount? }`. See the [event catalog](#format-conventions) in 3.4 for what's worth logging (boot/reset reason, Wi-Fi/ping failures, sensor disconnects, power/memory stats, config-applied confirmations).
+4. **Auto-watering (firmware 0.4.0+):** after the soil measurement, if moisture ≤ `soil.autoWaterPercent` — see [3.6](#36-auto-watering--pump-settings-waterings) for the checks, [`watering`](#post-devicesby-chipchipidwatering) for the request, and `report.waterings[]` for the record.
+5. **Before deep sleep (active mode only):** use `sleepSeconds` from the device config (received via `sync`) to set the sleep timer — or `pump.postWaterSleepSeconds` right after a watering.
+
+---
+
+## 6. Known gaps (worth knowing before relying on this API)
+
+- No authentication — anyone who can reach the server can read/write any device's data. Do not expose this server directly to the public internet without adding auth.
+- No request validation — malformed field names/types are silently accepted by the DB layer (or fail at the DB level with a generic error), aside from the minimal per-entry field checks `report`/`sync`'s `batteryLogs` do (missing required fields, unknown battery `type`).
+- No OTA/firmware-update endpoint — `firmwareVersion` is just a reported string.
+- `isActive`'s ownership rule (device-only for `false→true` at first contact, either side for `true→false` at any time) is a firmware/operator convention, not something the server enforces beyond the one hard rule it does apply (an existing device's `isActive` can never be flipped to `true` via `sync`'s body — see [isActive — ownership and behavior](#isactive--ownership-and-behavior)). `PUT /devices/:id` will still accept `{ "isActive": true }` from any caller; nothing stops a non-firmware caller from activating a device that way.
+- `device_logs.info` has no fixed schema at the database level — the [format conventions](#format-conventions) (common envelope, `event` as machine identifier) are a convention firmware/backend must both follow; nothing enforces it server-side.
+- **No "collect mode" feature.** `SoilSettings` previously had an inert `collectMode` boolean with no defined behavior on either side — it has been removed from the entity, DB schema, and dashboard UI. This functionality should **not** exist on the backend or on the ESP32 firmware; do not reintroduce it without first defining what it's actually supposed to do.
+- **Battery `checkEveryMs`/`checkAvgCount` are read by firmware; `batteryAlertPercent` and calibration are not.** `battery`'s config fields are read fresh by the device on every `sync` (via the response's `batteries[]` array) and voltage logging (`battery_logs`) is written by firmware — for both `type: "esp32"` (GPIO34) and, since firmware 0.4.0, `type: "pump"` (GPIO35). `batteryAlertPercent` and `battery_normalization` (calibration pairs) are stored but read by nothing yet — pure manual bookkeeping via their CRUD routes, same as `battery` itself has no revision/confirm sync (config changes just take effect on the device's next `sync` call, no "applied" confirmation exists for this resource). See [3.5](#35-battery-tracking--battery-battery-logs-battery-normalization).
+- **Breaking change, not backward-compatible.** `sync`/`report` replaced `register`/`ping`/`confirm`/`soil-settings confirm`/`soil-readings POST`/`device-logs POST` outright — those routes no longer exist. Firmware and backend must be updated together; there is no dual-running period where both old and new routes are live.
