@@ -2,7 +2,27 @@
 
 This document describes the backend API for ESP32 firmware/client developers. It covers all HTTP endpoints, request/response shapes, and the database schema behind them.
 
-> **Status note:** This backend is a minimal NestJS + PostgreSQL (TypeORM) service. There is currently **no authentication** on any endpoint, **no request validation** (any JSON is accepted and passed straight to the database), and **no MQTT/WebSocket support** — all communication is plain HTTP + JSON.
+> **Status note:** This backend is a minimal NestJS + PostgreSQL (TypeORM) service. There is **no request validation** (any JSON is accepted and passed straight to the database) and **no MQTT/WebSocket support** — all communication is plain HTTP + JSON.
+
+### Authentication
+
+Reads are public: every `GET` works without credentials, which is what the dashboard relies on to display data.
+
+Anything that **changes** data (`POST`, `PUT`, `PATCH`, `DELETE`) must send the admin token as a header:
+
+```
+X-Admin-Token: <ADMIN_TOKEN from the server's .env>
+```
+
+Without it the request is rejected with **401 Unauthorized**.
+
+**The three firmware endpoints are exempt** and need no token, since the board has no way to hold a dashboard secret:
+
+- `POST /devices/by-chip/:chipId/sync`
+- `POST /devices/by-chip/:chipId/report`
+- `POST /devices/by-chip/:chipId/watering`
+
+If `ADMIN_TOKEN` is not set in the environment, write protection is off entirely and every endpoint behaves as it did before — so an existing deployment doesn't break on upgrade.
 
 ---
 
@@ -550,7 +570,14 @@ Update a battery. Plain field merge — no revision bump, since there's no devic
 
 **Path params:** `id` (integer)
 
-**Body** — any subset of `Battery` fields.
+**Body** — any subset of `Battery` fields, plus:
+
+| Field | Notes |
+|---|---|
+| `voltCalib` | calibration factor, multimeter ÷ board, 0.8–1.2 (**400** otherwise). `1` = no correction |
+| `calibrateToVolt` | the voltage a multimeter shows on the cell now (2.5–4.5). The server sets `voltCalib = calibrateToVolt / latest raw volt` of this battery; **400** if the battery has no logs yet |
+
+> **Voltage calibration is server-side only.** The firmware sends what its ADC and divider give it; a divider of 5 % resistors isn't exactly 1:2 (the pump cell read 4.20 V against 4.08 V on a multimeter). `battery_logs` keep the raw values; `voltCalib` is applied whenever they're read — `GET /battery-logs`, the watering history, and the pump-cell check in [`watering`](#post-devicesby-chipchipidwatering). Changing it re-reads the whole history at the new factor; nothing stored is rewritten.
 
 **Response 200** — updated `Battery`
 **Response 404** — if `id` not found
@@ -570,7 +597,7 @@ List battery voltage/percentage log entries, newest first.
 
 **Query params:** `batteryId` (optional, integer) — when provided, scopes the list to that battery only; omit to list across all batteries.
 
-**Response 200** — `BatteryLog[]`
+**Response 200** — `BatteryLog[]`, calibrated: `volt` is the stored value × the battery's `voltCalib`, `percentage` is recomputed from it on the firmware's Li-ion curve (kept as stored when `voltCalib` is 1). `rawVolt` / `rawPercentage` carry what the board sent.
 
 #### `POST /battery-logs`
 Submit a battery log entry directly by `batteryId`. This exists for manual/admin use (e.g. backfilling a reading taken by hand) — the ESP32 itself submits its `esp32`-battery readings through [`sync`](#post-devicesby-chipchipidsync)'s `batteryLogs` array instead, addressed by `(chipId, type)` rather than a raw `batteryId`.
@@ -750,6 +777,7 @@ Postgres, via TypeORM. Schema is auto-synced from entities outside of production
 | `checkEveryMs` | int | no | `400` | interval between battery checks; read fresh by firmware every `sync` call |
 | `checkAvgCount` | int | no | `10` | number of samples to average per check; read fresh by firmware every `sync` call |
 | `batteryAlertPercent` | int | no | `30` | low-battery alert threshold; not yet read by anything |
+| `voltCalib` | real | no | `1` | multimeter ÷ board voltage factor, applied on read; the firmware never sees it |
 | `createdAt` | timestamptz | no | now() | |
 | `updatedAt` | timestamptz | no | now() | auto-updated on save |
 
