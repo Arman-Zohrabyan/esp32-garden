@@ -152,7 +152,10 @@ static BatteryLogPayload readBatteryForSync() {
 
   out.volt    = b.voltage;
   out.percent = b.percent;
-  Serial.printf("Батарея: %d%% (%.2f В)\n", out.percent, out.volt);
+  out.minVolt = b.minVolt;
+  out.maxVolt = b.maxVolt;
+  Serial.printf("Батарея: %d%% (%.3f В, окно %.3f..%.3f В)\n",
+                out.percent, out.volt, out.minVolt, out.maxVolt);
   return out;
 }
 
@@ -178,7 +181,10 @@ static BatteryLogPayload readPumpBatteryForSync() {
 
   out.volt    = b.voltage;
   out.percent = b.percent;
-  Serial.printf("Банка насоса: %d%% (%.2f В)\n", out.percent, out.volt);
+  out.minVolt = b.minVolt;
+  out.maxVolt = b.maxVolt;
+  Serial.printf("Банка насоса: %d%% (%.3f В, окно %.3f..%.3f В)\n",
+                out.percent, out.volt, out.minVolt, out.maxVolt);
   return out;
 }
 
@@ -368,17 +374,21 @@ static bool measureReading(ReportBatch& batch, SoilReadingPayload& out) {
 static void logCycleDone(ReportBatch& batch, uint32_t awakeMs,
                          const BatteryLogPayload& bat,
                          const BatteryLogPayload& pumpBat, bool watered) {
-  char extra[400];
+  // *MinVolt/*MaxVolt: spread of each battery's window (see batteryWindow).
+  char extra[512];
   snprintf(extra, sizeof(extra),
            "\"freeHeap\":%u,\"minFreeHeap\":%u,\"awakeMs\":%lu,\"rssi\":%d,"
            "\"batteryVolt\":%.2f,\"batteryPct\":%d,\"buffered\":%d,"
            "\"nvsWrites\":%lu,\"nvsWearPct\":%d,"
-           "\"pumpBatteryVolt\":%.2f,\"pumpBatteryPct\":%d,\"watered\":%s",
+           "\"pumpBatteryVolt\":%.2f,\"pumpBatteryPct\":%d,\"watered\":%s,"
+           "\"batteryMinVolt\":%.3f,\"batteryMaxVolt\":%.3f,"
+           "\"pumpBatteryMinVolt\":%.3f,\"pumpBatteryMaxVolt\":%.3f",
            ESP.getFreeHeap(), ESP.getMinFreeHeap(),
            (unsigned long)awakeMs, WiFi.RSSI(), bat.volt, bat.percent,
            readingsCount(),
            (unsigned long)readingsWriteCount(), readingsWearPercent(),
-           pumpBat.volt, pumpBat.percent, watered ? "true" : "false");
+           pumpBat.volt, pumpBat.percent, watered ? "true" : "false",
+           bat.minVolt, bat.maxVolt, pumpBat.minVolt, pumpBat.maxVolt);
   batch.addLog("info", "cycle_done", extra);
 }
 

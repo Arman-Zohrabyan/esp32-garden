@@ -77,6 +77,11 @@ struct BatteryLogPayload {
   const char* type    = "esp32";
   float       volt    = 0.0f;
   int32_t     percent = -1;   // -1 = don't send the record at all
+
+  // Lowest and highest reading of the window. Not sent in sync — they only
+  // go into the cycle_done log, to tell a flickering contact from a real sag.
+  float       minVolt = 0.0f;
+  float       maxVolt = 0.0f;
 };
 
 // POST /devices/by-chip/:chipId/sync — the only call at the start of the cycle.

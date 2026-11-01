@@ -12,7 +12,7 @@
 // FW_VERSION is set in platformio.ini via build_flags. The duplicate here is
 // in case of a build without the flags (e.g. straight from the IDE).
 #ifndef FW_VERSION
-#define FW_VERSION "0.4.0"
+#define FW_VERSION "0.4.1"
 #endif
 
 // We use http, not https. Rationale: mbedtls already takes 81 KB in the
@@ -169,8 +169,14 @@
 // Usually it comes out at 1.02-1.08. One point is enough.
 #define BATTERY_CALIB 1.0f
 
-// How many samples we average per reading.
+// How many fast ADC samples make one reading. The reading is their MEDIAN,
+// not the mean: one bad sample (a contact that flickers for a moment) would
+// drag a mean down, while the median simply doesn't see it.
 #define BATTERY_SAMPLES 32
+
+// Upper limit on the reading window (checkAvgCount from the server). The
+// window's median needs all its values in memory; 64 floats is 256 bytes.
+#define BATTERY_WINDOW_MAX 64
 
 // Exponential smoothing factor for the percentage: the smaller, the
 // smoother, but the slower the response to a real change.

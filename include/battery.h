@@ -15,6 +15,12 @@ struct BatteryReading {
   float voltage = 0.0f;
   int   percent = -1;      // -1 = not measured yet
   int   mvOnPin = 0;       // voltage at the pin itself, for diagnostics
+
+  // Spread of the window (batteryWindow / pumpBatteryWindow): the lowest and
+  // highest of its readings. One low value among steady ones means a contact
+  // flickered; all of them low means the voltage really sagged. 0 = no window.
+  float minVolt = 0.0f;
+  float maxVolt = 0.0f;
 };
 
 // Pin and attenuation setup, plus enabling the voltage divider (GPIO26 -> LOW).
@@ -25,9 +31,10 @@ void batteryBegin();
 // Turn off the voltage divider: GPIO26 to input without pulls, zero current through the voltage divider.
 void batteryDividerOff();
 
-// Battery voltage in volts. Averages 32 samples: a single
-// reading is noisy, and the switched sampling capacitor at the ADC input
-// "bites off" charge, so the first samples come out low.
+// Battery voltage in volts: the median of BATTERY_SAMPLES fast samples. A
+// single sample is noisy, and the switched sampling capacitor at the ADC
+// input "bites off" charge, so the first samples come out low. Median rather
+// than mean, so that a single outlier doesn't shift the result.
 float batteryVoltage();
 
 // Percent from the Li-ion discharge curve. A linear formula doesn't work here:
@@ -49,7 +56,12 @@ BatteryReading batteryRead();
 // and recovers within seconds. A stretched window catches exactly that and
 // gives the resting voltage instead of a random point in the sag.
 //
-// Parameters come from the server: checkAvgCount and checkEveryMs.
+// The result is the window's MEDIAN (min/max go to minVolt/maxVolt). With
+// the mean, one bad reading out of ten turned 3.95 V into ~3.76 V (33 % on
+// the dashboard instead of ~75 %) — that's what the jumps of 2026-10-31 were.
+//
+// Parameters come from the server: checkAvgCount and checkEveryMs (at most
+// BATTERY_WINDOW_MAX readings).
 BatteryReading batteryWindow(int count, uint32_t gapMs);
 
 // Last value without a new reading — for the web page and logs.
@@ -64,6 +76,7 @@ BatteryReading batteryLast();
 // The pump cell is unloaded during the reading (switch off), so the window
 // here only suppresses ADC noise; the parameters still come from the server
 // (row battery type="pump") so they can be controlled from the dashboard.
+// Median and min/max exactly as in batteryWindow().
 BatteryReading pumpBatteryWindow(int count, uint32_t gapMs);
 
 // Timer-based polling for inactive mode. Same interval as the

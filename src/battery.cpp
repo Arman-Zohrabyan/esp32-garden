@@ -29,6 +29,33 @@ static float smoothedPercent = -1.0f;   // -1 = smoothing not started yet
 static bool     dividerOn   = false;
 static uint32_t dividerOnAt = 0;        // millis() when the voltage divider was enabled
 
+// Median of n values. Sorts the array in place (insertion sort: n is at most
+// 64, and the arrays are local copies nobody needs in order). Even n: the
+// mean of the two middle values.
+template <typename T>
+static float medianOf(T* v, int n) {
+  for (int i = 1; i < n; i++) {
+    T x = v[i];
+    int j = i - 1;
+    while (j >= 0 && v[j] > x) { v[j + 1] = v[j]; j--; }
+    v[j + 1] = x;
+  }
+  return (n % 2) ? (float)v[n / 2] : ((float)v[n / 2 - 1] + (float)v[n / 2]) / 2.0f;
+}
+
+// One reading on a pin: the median of BATTERY_SAMPLES fast samples, in mV.
+// analogReadMilliVolts, NOT analogRead: the former uses the factory ADC
+// calibration from eFuse. The ESP32's raw ADC is nonlinear, with error
+// reaching 6% at the edges of the range.
+static int pinMedianMv(uint8_t pin) {
+  uint32_t samples[BATTERY_SAMPLES];
+  for (int i = 0; i < BATTERY_SAMPLES; i++) {
+    samples[i] = analogReadMilliVolts(pin);
+    delayMicroseconds(200);
+  }
+  return (int)lroundf(medianOf(samples, BATTERY_SAMPLES));
+}
+
 void batteryBegin() {
   // 11 dB — full input range (~0..3.1 V). With a 1:2 voltage divider and a
   // 4.2 V battery the pin sees 2.1 V, which fits with margin.
@@ -57,15 +84,7 @@ float batteryVoltage() {
   uint32_t since = millis() - dividerOnAt;
   if (dividerOn && since < BATTERY_SETTLE_MS) delay(BATTERY_SETTLE_MS - since);
 
-  // analogReadMilliVolts, NOT analogRead: the former uses the factory
-  // ADC calibration from eFuse. The ESP32's raw ADC is nonlinear, with error
-  // reaching 6% at the edges of the range.
-  uint32_t sum = 0;
-  for (int i = 0; i < BATTERY_SAMPLES; i++) {
-    sum += analogReadMilliVolts(PIN_BATTERY);
-    delayMicroseconds(200);
-  }
-  int mv = sum / BATTERY_SAMPLES;
+  int mv = pinMedianMv(PIN_BATTERY);
   lastReading.mvOnPin = mv;
 
   return (mv * DIVIDER * BATTERY_CALIB) / 1000.0f;
@@ -106,24 +125,26 @@ BatteryReading batteryLast() {
 
 BatteryReading batteryWindow(int count, uint32_t gapMs) {
   if (count < 1) count = 1;
+  if (count > BATTERY_WINDOW_MAX) count = BATTERY_WINDOW_MAX;
 
   // A window of readings with pauses — same as the soil sensor. A single reading catches
   // the instantaneous state, and under load Li-ion voltage "breathes":
   // it sags on a current pulse and recovers within seconds.
-  // Averaging over the window gives the resting voltage, not a random point.
-  float sum = 0.0f;
-  int   mvSum = 0;
+  // The window's median gives the resting voltage, not a random point —
+  // and, unlike the mean, isn't dragged by one bad reading.
+  float volts[BATTERY_WINDOW_MAX];
+  int   mvs[BATTERY_WINDOW_MAX];
 
   for (int i = 0; i < count; i++) {
-    sum   += batteryVoltage();
-    mvSum += lastReading.mvOnPin;
+    volts[i] = batteryVoltage();
+    mvs[i]   = lastReading.mvOnPin;
 
     // No pause after the last reading: it would just delay the cycle
     // for nothing. Exactly count-1 pauses, same as in the soil window.
     if (i < count - 1) delay(gapMs);
   }
 
-  float v = sum / count;
+  float v = medianOf(volts, count);     // sorted now: [0] = min, [count-1] = max
   int   p = batteryPercent(v);
 
   if (smoothedPercent < 0) smoothedPercent = p;
@@ -131,7 +152,9 @@ BatteryReading batteryWindow(int count, uint32_t gapMs) {
 
   lastReading.voltage = v;
   lastReading.percent = (int)lroundf(smoothedPercent);
-  lastReading.mvOnPin = mvSum / count;
+  lastReading.mvOnPin = (int)lroundf(medianOf(mvs, count));
+  lastReading.minVolt = volts[0];
+  lastReading.maxVolt = volts[count - 1];
   return lastReading;
 }
 
@@ -140,6 +163,7 @@ static const float PUMP_DIVIDER = (PUMP_BAT_R1 + PUMP_BAT_R2) / PUMP_BAT_R2;
 
 BatteryReading pumpBatteryWindow(int count, uint32_t gapMs) {
   if (count < 1) count = 1;
+  if (count > BATTERY_WINDOW_MAX) count = BATTERY_WINDOW_MAX;
 
   // ADC resolution is already set in batteryBegin(); attenuation is set per
   // pin. 11 dB: with a 1:2 voltage divider a full cell gives 2.1 V at the pin.
@@ -152,23 +176,23 @@ BatteryReading pumpBatteryWindow(int count, uint32_t gapMs) {
   digitalWrite(PIN_PUMP_BAT_EN, LOW);
   delay(BATTERY_SETTLE_MS);
 
-  uint32_t mvSum = 0;
+  int mvs[BATTERY_WINDOW_MAX];
   for (int i = 0; i < count; i++) {
-    uint32_t sum = 0;
-    for (int k = 0; k < BATTERY_SAMPLES; k++) {
-      sum += analogReadMilliVolts(PIN_PUMP_BAT);
-      delayMicroseconds(200);
-    }
-    mvSum += sum / BATTERY_SAMPLES;
+    mvs[i] = pinMedianMv(PIN_PUMP_BAT);
     if (i < count - 1) delay(gapMs);
   }
 
   pinMode(PIN_PUMP_BAT_EN, INPUT);        // no pulls: voltage divider is open
 
+  // Window median, same reasoning as in batteryWindow(). The sort leaves
+  // the lowest reading in [0] and the highest in [count-1].
+  const float toVolts = PUMP_DIVIDER * PUMP_BAT_CALIB / 1000.0f;
   BatteryReading r;
-  r.mvOnPin = mvSum / count;
-  r.voltage = (r.mvOnPin * PUMP_DIVIDER * PUMP_BAT_CALIB) / 1000.0f;
+  r.mvOnPin = (int)lroundf(medianOf(mvs, count));
+  r.voltage = r.mvOnPin * toVolts;
   r.percent = batteryPercent(r.voltage);
+  r.minVolt = mvs[0] * toVolts;
+  r.maxVolt = mvs[count - 1] * toVolts;
   return r;
 }
 
