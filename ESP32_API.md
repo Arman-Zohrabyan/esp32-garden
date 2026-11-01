@@ -21,6 +21,7 @@ Without it the request is rejected with **401 Unauthorized**.
 - `POST /devices/by-chip/:chipId/sync`
 - `POST /devices/by-chip/:chipId/report`
 - `POST /devices/by-chip/:chipId/watering`
+- `PUT /devices/:id` with **exactly** `{"isActive": true}` — the board's own "activate" button on garden.local. Any other body on this route (another field, `isActive: false`, a non-boolean) still needs the token.
 
 If `ADMIN_TOKEN` is not set in the environment, write protection is off entirely and every endpoint behaves as it did before — so an existing deployment doesn't break on upgrade.
 
